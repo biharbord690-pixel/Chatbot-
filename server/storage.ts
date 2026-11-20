@@ -16,6 +16,7 @@ import { scheduleRemoteBackup } from './remote-backup';
 
 export const DATA_DIR = path.join(process.cwd(), 'data');
 export const BAILEYS_AUTH_DIR = path.join(DATA_DIR, 'baileys_auth');
+export const DEFAULT_ADMIN_EMAIL = 'bihargraminbazaar98@gmail.com';
 const STORE_FILE = path.join(DATA_DIR, 'crm_store.json');
 const SECRETS_FILE = path.join(DATA_DIR, 'secrets.enc');
 const KEY_FILE = path.join(DATA_DIR, '.vault.key');
@@ -130,6 +131,14 @@ function cleanOptionalEnv(value: string | undefined): string {
     return '';
   }
   return trimmed;
+}
+
+export function getAuthorizedAdminEmail(): string {
+  const envEmail = cleanOptionalEnv(process.env.ADMIN_EMAIL);
+  if (envEmail && envEmail.includes('@')) {
+    return envEmail.toLowerCase();
+  }
+  return DEFAULT_ADMIN_EMAIL;
 }
 
 function getEncryptionKey(): Buffer {
@@ -308,6 +317,7 @@ class StorageManager {
   private data: PersistedStore;
   private botSentSet: Set<string>;
   private saveTimer: NodeJS.Timeout | null = null;
+  private lastLoadMigratedAdmin = false;
 
   constructor() {
     ensureDataDir();
@@ -315,7 +325,29 @@ class StorageManager {
     this.botSentSet = new Set(this.data.botSentMessageIds || []);
   }
 
+  private syncAdminAccountEmail(store: PersistedStore): boolean {
+    if (!store.admin) return false;
+    const targetEmail = getAuthorizedAdminEmail();
+    let changed = false;
+
+    if (store.admin.email.toLowerCase() !== targetEmail) {
+      store.admin.email = targetEmail;
+      changed = true;
+    }
+
+    const envPassword = cleanOptionalEnv(process.env.ADMIN_PASSWORD);
+    if (envPassword && envPassword.length >= 6) {
+      if (!bcrypt.compareSync(envPassword, store.admin.passwordHash)) {
+        store.admin.passwordHash = bcrypt.hashSync(envPassword, 10);
+        changed = true;
+      }
+    }
+
+    return changed;
+  }
+
   private loadFromDisk(): PersistedStore {
+    this.lastLoadMigratedAdmin = false;
     const initial = createInitialStore();
     if (!fs.existsSync(STORE_FILE)) {
       this.writeImmediate(initial);
@@ -323,7 +355,7 @@ class StorageManager {
     }
     try {
       const parsed = JSON.parse(fs.readFileSync(STORE_FILE, 'utf8')) as Partial<PersistedStore>;
-      return {
+      const merged: PersistedStore = {
         ...initial,
         ...parsed,
         settings: {
@@ -344,6 +376,11 @@ class StorageManager {
         whatsappOrderIds: Array.isArray(parsed.whatsappOrderIds) ? parsed.whatsappOrderIds : [],
         botSentMessageIds: Array.isArray(parsed.botSentMessageIds) ? parsed.botSentMessageIds : [],
       };
+      if (this.syncAdminAccountEmail(merged)) {
+        this.lastLoadMigratedAdmin = true;
+        this.writeImmediate(merged);
+      }
+      return merged;
     } catch {
       return initial;
     }
@@ -363,6 +400,9 @@ class StorageManager {
     }
     this.data = this.loadFromDisk();
     this.botSentSet = new Set(this.data.botSentMessageIds || []);
+    if (this.lastLoadMigratedAdmin) {
+      scheduleRemoteBackup('admin_email_sync');
+    }
   }
 
   public persist(): void {

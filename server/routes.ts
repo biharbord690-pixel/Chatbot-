@@ -12,6 +12,7 @@ import { generateAiReply } from './gemini-engine';
 import { messageRouter } from './message-router';
 import {
   DEFAULT_SYSTEM_PROMPT,
+  getAuthorizedAdminEmail,
   getJwtSecret,
   saveSecrets,
   storage,
@@ -213,13 +214,19 @@ export function createApiRouter(): express.Router {
 
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) {
-      res.status(400).json({ error: 'Provide a valid name, email, and password (min 6 chars).' });
+      res.status(400).json({ error: 'Please check your input and try again.' });
+      return;
+    }
+
+    const normalizedEmail = parsed.data.email.trim().toLowerCase();
+    if (normalizedEmail !== getAuthorizedAdminEmail()) {
+      res.status(403).json({ error: 'Access denied.' });
       return;
     }
 
     const account = {
       id: 'admin-1',
-      email: parsed.data.email.trim().toLowerCase(),
+      email: normalizedEmail,
       name: parsed.data.name.trim(),
       passwordHash: bcrypt.hashSync(parsed.data.password, 10),
       createdAt: new Date().toISOString(),
@@ -249,7 +256,7 @@ export function createApiRouter(): express.Router {
     const password = String(req.body?.password || '');
 
     if (email !== store.admin.email || !bcrypt.compareSync(password, store.admin.passwordHash)) {
-      res.status(401).json({ error: 'Invalid email or password.' });
+      res.status(401).json({ error: 'Invalid credentials.' });
       return;
     }
 

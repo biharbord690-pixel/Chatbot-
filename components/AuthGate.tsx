@@ -83,8 +83,8 @@ export default function AuthGate({
             </h1>
             <p className="mt-2 text-sm text-slate-600 dark:text-slate-400 leading-relaxed">
               {needsSetup
-                ? 'Create your encrypted administrator credentials to manage WhatsApp QR sessions, Gemini AI automation, and live store sync.'
-                : 'Enter your administrator credentials to access the Live Inbox, WhatsApp Channels, and E-Commerce Sync.'}
+                ? 'Set up your workspace to manage WhatsApp QR sessions, Gemini AI automation, and live store sync.'
+                : 'Access the Live Inbox, WhatsApp Channels, and E-Commerce Sync.'}
             </p>
           </div>
 
@@ -107,7 +107,7 @@ export default function AuthGate({
                     required
                     value={name}
                     onChange={(e) => setName(e.target.value)}
-                    placeholder="Store Operations Lead"
+                    placeholder="BGB Admin"
                     className="w-full pl-9 pr-3 py-2.5 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-600/30 focus:border-emerald-600"
                   />
                 </div>
@@ -116,16 +116,16 @@ export default function AuthGate({
 
             <div>
               <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">
-                Admin Email
+                Email
               </label>
               <div className="relative">
                 <Mail className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
                 <input
                   type="email"
                   required
+                  autoComplete="username"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
-                  placeholder="admin@bihargraminbazaar.com"
                   className="w-full pl-9 pr-3 py-2.5 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-600/30 focus:border-emerald-600"
                 />
               </div>
@@ -141,9 +141,9 @@ export default function AuthGate({
                   type="password"
                   required
                   minLength={6}
+                  autoComplete={needsSetup ? 'new-password' : 'current-password'}
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
-                  placeholder="Minimum 6 characters"
                   className="w-full pl-9 pr-3 py-2.5 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-600/30 focus:border-emerald-600"
                 />
               </div>
@@ -161,7 +161,7 @@ export default function AuthGate({
 
           <div className="mt-6 pt-5 border-t border-slate-200 dark:border-slate-800 flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
             <ShieldCheck className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0" />
-            <span>JWT HttpOnly session · Server-side AES-256-GCM secret vault</span>
+            <span>Protected Workspace · Bihar Gramin Bazaar</span>
           </div>
         </div>
       </main>

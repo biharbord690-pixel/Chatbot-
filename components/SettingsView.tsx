@@ -314,8 +314,8 @@ export default function SettingsView({
           <div className="py-3 flex items-center justify-between gap-4">
             <div>
               <p className="font-medium text-slate-900 dark:text-white">Signed-in Administrator</p>
-              <p className="text-xs text-slate-500 dark:text-slate-400 font-mono">
-                {user.name} · {user.email}
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                {user.name}
               </p>
             </div>
             <button
@@ -336,11 +336,8 @@ export default function SettingsView({
           <KeyRound className="w-4 h-4 text-slate-500" />
           <div>
             <h2 className="text-base font-semibold text-slate-900 dark:text-white">
-              Update Administrator Password
+              Account Security
             </h2>
-            <p className="text-xs text-slate-500 dark:text-slate-400">
-              Passwords are stored using salted bcrypt hashes
-            </p>
           </div>
         </div>
 
