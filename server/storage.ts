@@ -16,6 +16,7 @@ import { scheduleRemoteBackup } from './remote-backup';
 
 export const DATA_DIR = path.join(process.cwd(), 'data');
 export const BAILEYS_AUTH_DIR = path.join(DATA_DIR, 'baileys_auth');
+export const MEDIA_DIR = path.join(DATA_DIR, 'media');
 export const DEFAULT_ADMIN_EMAIL = 'bihargraminbazaar9@gmail.com';
 const STORE_FILE = path.join(DATA_DIR, 'crm_store.json');
 const SECRETS_FILE = path.join(DATA_DIR, 'secrets.enc');
@@ -55,6 +56,14 @@ export interface PersistedStore {
   ordersCache: StoreOrder[];
   orderStageSnapshots: Record<string, { deliveryStage: string; status: string }>;
   whatsappOrderIds: string[];
+  recentOrderGuards: Array<{
+    phone: string;
+    productId: string;
+    productName: string;
+    orderId: string;
+    totalAmount?: number;
+    createdAt: number;
+  }>;
   botSentMessageIds: string[];
   lastSyncAt: string | null;
 }
@@ -62,11 +71,16 @@ export interface PersistedStore {
 export const DEFAULT_SYSTEM_PROMPT = `आप 'बिहार ग्रामीण बाज़ार' (Bihar Gramin Bazaar - https://bihargraminbazaar.com) के मिलनसार, स्मार्ट और भरोसेमंद WhatsApp ग्राहक सहायता सहायक हैं।
 
 सख्त नियम और बातचीत का अंदाज़:
-1. सभी भाषाओं में फ्रेंडली और नैचुरल बातचीत:
-   - ग्राहक जिस भाषा या अंदाज़ में बात करे — Hinglish (जैसे "hello", "bhai rate btao", "order kaise kre"), English, शुद्ध हिंदी, मैथिली (Maithili - जैसे "प्रणाम, केना छी? की चाहि अहाँ के?"), या बिहारी / भोजपुरी / मगही (Bihari/Bhojpuri - जैसे "प्रणाम जी, का हाल बा? बताईं का चाहीं?") — ठीक उसी भाषा और दोस्ताना अंदाज़ में नैचुरल इंसान की तरह बात करें।
-   - हर मैसेज पर एक ही लंबा वेलकम मैसेज बार-बार न दोहराएँ। पहली बार प्यार से स्वागत करें (जैसे Hinglish में "Namaste ji! Bihar Gramin Bazaar me aapka swagat hai 😊 Bataiye kya madad kar sakta hoon?"), उसके बाद ग्राहक के सवाल के हिसाब से सीधा, छोटा और काम का जवाब दें।
+1. जितना पूछा जाए, सिर्फ़ उतना ही और सटीक जवाब दें (अत्यंत महत्वपूर्ण):
+   - ग्राहक के आख़िरी मैसेज को ध्यान से पढ़ें और केवल उसी सवाल का सीधा, छोटा और काम का जवाब दें (आमतौर पर 1 से 4 लाइन में)।
+   - बिना पूछे पुराने प्रोडक्ट्स, लंबी स्कीम, या फालतू ऑफर्स दोबारा न लिखें। हर मैसेज में बार-बार लंबा वेलकम मैसेज न दोहराएँ।
+   - अगर ग्राहक कहे "owner से बात करनी है" या "owner को बोलो msg/call करे", तो बस विनम्रता से 1–2 लाइन में कहें कि आपकी बात हमारे टीम/ओनर तक पहुँच जाएगी और वे यहीं रिप्लाई करेंगे, या आप +91 9472258022 पर कॉल कर सकते हैं — उस समय कोई प्रोडक्ट पिच न करें।
+   - WhatsApp फॉर्मेटिंग: बोल्ड के लिए केवल सिंगल स्टार (*शब्द*) इस्तेमाल करें, कभी भी डबल स्टार (**शब्द**) न लिखें।
 
-2. आपकी पहचान और बनाने वाले के बारे में (अत्यंत महत्वपूर्ण):
+2. सभी भाषाओं में फ्रेंडली और नैचुरल बातचीत:
+   - ग्राहक जिस भाषा या अंदाज़ में बात करे — Hinglish (जैसे "hello", "bhai rate btao", "order kaise kre"), English, शुद्ध हिंदी, मैथिली (Maithili - जैसे "प्रणाम, केना छी? की चाहि अहाँ के?"), या बिहारी / भोजपुरी / मगही (Bihari/Bhojpuri - जैसे "प्रणाम जी, का हाल बा? बताईं का चाहीं?") — ठीक उसी भाषा और दोस्ताना अंदाज़ में नैचुरल इंसान की तरह बात करें।
+
+3. आपकी पहचान और बनाने वाले के बारे में:
    - अगर कोई पूछे "तुम्हें किसने बनाया है?", "Who made you?", "Kaun banaya hai?", "Tum kaun ho?", या "Kya tum Google/Gemini/ChatGPT ho?":
      • हमेशा साफ और गर्व से ग्राहक की भाषा में जवाब दें:
        - Hinglish: "Mujhe Bihar Gramin Bazaar ke dwara logon ki madad karne ke liye banaya gaya hai! 😊"
@@ -75,22 +89,22 @@ export const DEFAULT_SYSTEM_PROMPT = `आप 'बिहार ग्रामी
        - Maithili/Bihari: "Hamra Bihar Gramin Bazaar ke dwara sab lokak madad karay lel banael gel chhi! 😊"
    - कभी भी Google, Gemini, OpenAI, ChatGPT, या किसी बाहरी कंपनी/मॉडल का नाम भूलकर भी न लें।
 
-3. सिर्फ़ Bihar Gramin Bazaar के बारे में ही बात करें (बाहरी विषय सख्त मना हैं):
+4. सिर्फ़ Bihar Gramin Bazaar के बारे में ही बात करें (बाहरी विषय सख्त मना हैं):
    - आप केवल बिहार ग्रामीण बाज़ार (https://bihargraminbazaar.com) के प्रोडक्ट्स, कीमत, ऑफर/कूपन, ऑर्डर बुक करने, COD/UPI पेमेंट, डिलीवरी ट्रैकिंग, और रिप्लेसमेंट/सपोर्ट के बारे में ही मदद करेंगे।
-   - अगर कोई बाहरी सवाल पूछे (जैसे राजनीति, फिल्म, मौसम, पढ़ाई/मैथ्स, कोडिंग, जोक्स, न्यूज़, जनरल नॉलेज, या किसी दूसरी वेबसाइट/ऐप के बारे में), तो विनम्रता से मना करें और बातचीत को बिहार ग्रामीण बाज़ार पर वापस लाएँ (जैसे: "Maaf kijiye ji, main sirf Bihar Gramin Bazaar ke products, orders aur delivery me madad kar sakta hoon. Bataiye aapko hamari website par kaunsa product dekhna hai?").
+   - अगर कोई बाहरी सवाल पूछे (राजनीति, फिल्म, मौसम, पढ़ाई/मैथ्स, कोडिंग, जोक्स, न्यूज़, जनरल नॉलेज, या दूसरी वेबसाइट/ऐप), तो विनम्रता से 1–2 लाइन में मना करें और Bihar Gramin Bazaar की मदद ऑफ़र करें।
 
-4. स्टोर नीतियाँ और ऑफर्स:
+5. स्टोर नीतियाँ और ऑफर्स:
    - बिहार के सभी 38 ज़िलों में कैश ऑन डिलीवरी (COD) और UPI उपलब्ध है।
-   - ₹499 या उससे अधिक के ऑर्डर पर फ्री डिलीवरी है। ₹499 से कम के ऑर्डर पर मात्र ₹40 डिलीवरी चार्ज लगता है।
-   - डिलीवरी समय: 2 से 4 दिन · 7 दिन की आसान रिप्लेसमेंट गारंटी।
-   - कस्टमर केयर नंबर: +91 9472258022 · वेबसाइट: https://bihargraminbazaar.com
-   - उपलब्ध कूपन: DESHI50 (₹299+ पर ₹50 छूट), BGB100 (₹499+ पर ₹100 छूट), BIHAR150 (₹999+ पर ₹150 छूट)।
+   - ₹499+ के ऑर्डर पर फ्री डिलीवरी; ₹499 से कम पर ₹40 डिलीवरी चार्ज।
+   - डिलीवरी समय: 2–4 दिन · 7 दिन आसान रिप्लेसमेंट गारंटी।
+   - हेल्पलाइन: +91 9472258022 · वेबसाइट: https://bihargraminbazaar.com
+   - कूपन: DESHI50 (₹299+ पर ₹50 छूट), BGB100 (₹499+ पर ₹100 छूट), BIHAR150 (₹999+ पर ₹150 छूट)।
 
-5. लाइव टूल्स का प्रयोग:
-   - जब भी ग्राहक किसी प्रोडक्ट, कीमत, रंग, साइज या उपलब्धता के बारे में पूछे, हमेशा search_products टूल चलाएँ। कभी भी मन से कीमत या स्टॉक न बताएँ।
-   - ऑर्डर कन्फर्म करने से पहले ग्राहक से ये सभी विवरण अवश्य लें: (क) उत्पाद व मात्रा (और रंग/साइज यदि लागू हो), (ख) पूरा नाम, (ग) 10 अंकों का मोबाइल नंबर, (घ) गाँव/मोहल्ला/पूरा पता, (ङ) बिहार का ज़िला, (च) 6 अंकों का पिनकोड, और (छ) पेमेंट मोड (COD या UPI)। सभी जानकारी पक्की होने पर ही place_order टूल चलाएँ।
-   - ऑर्डर ट्रैकिंग, डिलीवरी एजेंट का नाम/नंबर, या पेमेंट स्टेटस पूछने पर check_order_status टूल चलाएँ।
-   - जवाब छोटे, दोस्ताना, व्हाट्सएप-अनुकूल और सटीक रखें।`;
+6. लाइव टूल्स और सिंगल-ऑर्डर नियम:
+   - जब ग्राहक किसी प्रोडक्ट, कीमत, रंग, साइज या स्टॉक के बारे में पूछे, हमेशा search_products टूल चलाएँ। मन से कीमत या स्टॉक न बताएँ।
+   - ऑर्डर कन्फर्म करने से पहले ग्राहक से ये विवरण लें: (1) उत्पाद व मात्रा, (2) पूरा नाम, (3) 10 अंकों का मोबाइल नंबर, (4) गाँव/मोहल्ला/पूरा पता, (5) बिहार का ज़िला, (6) 6 अंकों का पिनकोड, और (7) पेमेंट मोड (COD या UPI)।
+   - सभी जानकारी पक्की होने पर place_order टूल *केवल एक बार* चलाएँ। अगर ऑर्डर पहले ही कन्फर्म हो चुका है (Order ID मिल चुका है) या ग्राहक बस "ok / thanks / confirm" बोले, तो दोबारा place_order कभी न चलाएँ।
+   - ऑर्डर ट्रैकिंग या डिलीवरी एजेंट की जानकारी के लिए check_order_status टूल चलाएँ।`;
 
 export const DEFAULT_KEYWORD_REPLIES: KeywordQuickReply[] = [
   {
@@ -125,6 +139,9 @@ function ensureDataDir(): void {
   }
   if (!fs.existsSync(BAILEYS_AUTH_DIR)) {
     fs.mkdirSync(BAILEYS_AUTH_DIR, { recursive: true });
+  }
+  if (!fs.existsSync(MEDIA_DIR)) {
+    fs.mkdirSync(MEDIA_DIR, { recursive: true });
   }
 }
 
@@ -322,7 +339,7 @@ function createInitialStore(): PersistedStore {
         freeDeliveryThreshold: 499,
         deliveryFeeBelowThreshold: 40,
         autoNotifyOrderStages: true,
-        syncIntervalMinutes: 5,
+        syncIntervalMinutes: 1,
       },
       meta: {
         enabled: Boolean(metaPhoneNumberId && metaAccessToken),
@@ -340,6 +357,7 @@ function createInitialStore(): PersistedStore {
     ordersCache: [],
     orderStageSnapshots: {},
     whatsappOrderIds: [],
+    recentOrderGuards: [],
     botSentMessageIds: [],
     lastSyncAt: null,
   };
@@ -406,6 +424,7 @@ class StorageManager {
         ordersCache: Array.isArray(parsed.ordersCache) ? parsed.ordersCache : [],
         orderStageSnapshots: parsed.orderStageSnapshots || {},
         whatsappOrderIds: Array.isArray(parsed.whatsappOrderIds) ? parsed.whatsappOrderIds : [],
+        recentOrderGuards: Array.isArray(parsed.recentOrderGuards) ? parsed.recentOrderGuards : [],
         botSentMessageIds: Array.isArray(parsed.botSentMessageIds) ? parsed.botSentMessageIds : [],
       };
       let diskMutated = false;
@@ -427,12 +446,13 @@ class StorageManager {
         diskMutated = true;
       }
 
-      // Automatically upgrade old built-in default system prompt to the new multilingual + BGB creator identity prompt
+      // Automatically upgrade old built-in default system prompt to the latest concise & single-order prompt
       const currentPrompt = merged.settings.ai.systemPrompt || '';
       if (
         currentPrompt.includes('बिहार ग्रामीण बाज़ार') &&
-        currentPrompt.includes('आधिकारिक, अति-विनम्र') &&
-        !currentPrompt.includes('द्वारा लोगों की मदद')
+        (currentPrompt.includes('आधिकारिक, अति-विनम्र') ||
+          currentPrompt.includes('1. सभी भाषाओं में फ्रेंडली और नैचुरल बातचीत:')) &&
+        !currentPrompt.includes('जितना पूछा जाए, सिर्फ़ उतना ही')
       ) {
         merged.settings.ai.systemPrompt = DEFAULT_SYSTEM_PROMPT;
         this.lastLoadMigratedAdmin = true;
@@ -448,11 +468,38 @@ class StorageManager {
     }
   }
 
+  private writeInProgress = false;
+  private writePending = false;
+
   private writeImmediate(store: PersistedStore): void {
     ensureDataDir();
     const tmpPath = `${STORE_FILE}.tmp`;
-    fs.writeFileSync(tmpPath, JSON.stringify(store, null, 2), 'utf8');
+    fs.writeFileSync(tmpPath, JSON.stringify(store), 'utf8');
     fs.renameSync(tmpPath, STORE_FILE);
+  }
+
+  private async writeAsync(): Promise<void> {
+    if (this.writeInProgress) {
+      this.writePending = true;
+      return;
+    }
+    this.writeInProgress = true;
+    try {
+      ensureDataDir();
+      const tmpPath = `${STORE_FILE}.tmp`;
+      const payload = JSON.stringify(this.data);
+      await fs.promises.writeFile(tmpPath, payload, 'utf8');
+      await fs.promises.rename(tmpPath, STORE_FILE);
+      scheduleRemoteBackup('storage');
+    } catch (err) {
+      console.error('[Storage] Failed to persist store:', err);
+    } finally {
+      this.writeInProgress = false;
+      if (this.writePending) {
+        this.writePending = false;
+        void this.writeAsync();
+      }
+    }
   }
 
   public reloadFromDisk(): void {
@@ -472,13 +519,9 @@ class StorageManager {
       clearTimeout(this.saveTimer);
     }
     this.saveTimer = setTimeout(() => {
-      try {
-        this.writeImmediate(this.data);
-        scheduleRemoteBackup('storage');
-      } catch (err) {
-        console.error('[Storage] Failed to persist store:', err);
-      }
-    }, 150);
+      this.saveTimer = null;
+      void this.writeAsync();
+    }, 500);
   }
 
   public persistNow(): void {
@@ -621,6 +664,53 @@ class StorageManager {
     }
   }
 
+  public findRecentOrderGuard(
+    phone10: string,
+    productId: string,
+    windowMs = 30 * 60 * 1000
+  ): {
+    phone: string;
+    productId: string;
+    productName: string;
+    orderId: string;
+    totalAmount?: number;
+    createdAt: number;
+  } | null {
+    const cleanPhone = phone10.replace(/[^0-9]/g, '').slice(-10);
+    const cutoff = Date.now() - windowMs;
+    const guards = this.data.recentOrderGuards || [];
+    const match = guards.find(
+      (g) => g.phone === cleanPhone && g.productId === productId && g.createdAt >= cutoff
+    );
+    return match || null;
+  }
+
+  public recordRecentOrderGuard(entry: {
+    phone: string;
+    productId: string;
+    productName: string;
+    orderId: string;
+    totalAmount?: number;
+  }): void {
+    const cleanPhone = entry.phone.replace(/[^0-9]/g, '').slice(-10);
+    const cutoff = Date.now() - 2 * 60 * 60 * 1000; // retain 2h history
+    this.data.recentOrderGuards = (this.data.recentOrderGuards || []).filter(
+      (g) => g.createdAt >= cutoff
+    );
+    this.data.recentOrderGuards.unshift({
+      phone: cleanPhone,
+      productId: entry.productId,
+      productName: entry.productName,
+      orderId: entry.orderId,
+      totalAmount: entry.totalAmount,
+      createdAt: Date.now(),
+    });
+    if (this.data.recentOrderGuards.length > 300) {
+      this.data.recentOrderGuards = this.data.recentOrderGuards.slice(0, 300);
+    }
+    this.persist();
+  }
+
   public recordBotSentMessageId(wamId: string): void {
     if (!wamId) return;
     this.botSentSet.add(wamId);
@@ -642,6 +732,224 @@ class StorageManager {
   public isBotSentMessageId(wamId: string): boolean {
     if (!wamId) return false;
     return this.botSentSet.has(wamId);
+  }
+
+  public saveInboundMedia(
+    buffer: Buffer,
+    mimeType: string,
+    kind: 'image' | 'audio'
+  ): string | undefined {
+    try {
+      ensureDataDir();
+      if (!buffer || buffer.length === 0 || buffer.length > 6 * 1024 * 1024) {
+        return undefined;
+      }
+      const cleanMime = (mimeType || '').split(';')[0].trim().toLowerCase();
+      const extMap: Record<string, string> = {
+        'image/jpeg': 'jpg',
+        'image/jpg': 'jpg',
+        'image/png': 'png',
+        'image/webp': 'webp',
+        'image/gif': 'gif',
+        'audio/ogg': 'ogg',
+        'audio/opus': 'ogg',
+        'audio/mpeg': 'mp3',
+        'audio/mp3': 'mp3',
+        'audio/mp4': 'm4a',
+        'audio/aac': 'aac',
+        'audio/wav': 'wav',
+        'audio/webm': 'webm',
+      };
+      const ext = extMap[cleanMime] || (kind === 'image' ? 'jpg' : 'ogg');
+      const filename = `${kind}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+      const fullPath = path.join(MEDIA_DIR, filename);
+      fs.writeFileSync(fullPath, buffer);
+
+      // Keep media folder lean (max 250 recent files) so Render disk stays lightweight
+      try {
+        const files = fs
+          .readdirSync(MEDIA_DIR)
+          .map((name) => {
+            const p = path.join(MEDIA_DIR, name);
+            return { name, p, mtime: fs.statSync(p).mtimeMs };
+          })
+          .sort((a, b) => b.mtime - a.mtime);
+        if (files.length > 250) {
+          for (const old of files.slice(250)) {
+            fs.unlinkSync(old.p);
+          }
+        }
+      } catch {
+        // ignore prune errors
+      }
+
+      return `/api/media/${filename}`;
+    } catch {
+      return undefined;
+    }
+  }
+
+  public resolveMediaFilePath(filename: string): string | null {
+    if (!filename || !/^[a-zA-Z0-9._-]+$/.test(filename)) return null;
+    const resolvedRoot = path.resolve(MEDIA_DIR);
+    const full = path.resolve(MEDIA_DIR, filename);
+    if (!full.startsWith(resolvedRoot + path.sep)) return null;
+    if (!fs.existsSync(full)) return null;
+    return full;
+  }
+
+  /**
+   * Bulk-imports synced WhatsApp contacts, chats, and historical messages into the CRM Inbox
+   * WITHOUT triggering AI auto-replies. Deduplicates cleanly by wamId.
+   */
+  public importWhatsAppHistory(params: {
+    contacts?: Array<{ phone: string; rawJid?: string; altJid?: string; name?: string }>;
+    chats?: Array<{
+      phone: string;
+      rawJid?: string;
+      altJid?: string;
+      name?: string;
+      lastMessageAt?: string;
+      unreadCount?: number;
+    }>;
+    messages?: ChatMessage[];
+  }): { chatsImported: number; messagesImported: number } {
+    let chatsImported = 0;
+    let messagesImported = 0;
+    const nowIso = new Date().toISOString();
+
+    if (params.contacts && params.contacts.length > 0) {
+      for (const c of params.contacts) {
+        const phone = this.normalizePhone(c.phone);
+        if (!phone) continue;
+        const existing = this.data.sessions[phone];
+        const cleanName = (c.name || '').trim();
+        if (existing) {
+          if (cleanName && (existing.name.startsWith('+') || existing.name === phone)) {
+            existing.name = cleanName;
+          }
+          if (c.rawJid && !existing.rawJid) existing.rawJid = c.rawJid;
+          if (c.altJid && !existing.altJid) existing.altJid = c.altJid;
+        }
+      }
+    }
+
+    if (params.chats && params.chats.length > 0) {
+      for (const ch of params.chats) {
+        const phone = this.normalizePhone(ch.phone);
+        if (!phone) continue;
+        const existing = this.data.sessions[phone];
+        const cleanName = (ch.name || '').trim();
+        if (!existing) {
+          this.data.sessions[phone] = {
+            phone,
+            rawJid: ch.rawJid,
+            altJid: ch.altJid,
+            name: cleanName || `+${phone}`,
+            state: 'IDLE',
+            channel: 'baileys',
+            aiEnabled: true,
+            aiPausedUntil: null,
+            aiPausedIndefinitely: false,
+            handoverSource: null,
+            unreadCount: ch.unreadCount || 0,
+            lastMessage: '',
+            lastMessageDirection: 'INBOUND',
+            lastMessageAt: ch.lastMessageAt || nowIso,
+            createdAt: ch.lastMessageAt || nowIso,
+            context: {},
+          };
+          chatsImported += 1;
+        } else {
+          if (cleanName && (existing.name.startsWith('+') || existing.name === phone)) {
+            existing.name = cleanName;
+          }
+          if (ch.rawJid && !existing.rawJid) existing.rawJid = ch.rawJid;
+          if (ch.altJid && !existing.altJid) existing.altJid = ch.altJid;
+          if (
+            ch.lastMessageAt &&
+            new Date(ch.lastMessageAt).getTime() > new Date(existing.lastMessageAt).getTime()
+          ) {
+            existing.lastMessageAt = ch.lastMessageAt;
+          }
+        }
+      }
+    }
+
+    if (params.messages && params.messages.length > 0) {
+      const existingWamIds = new Set(this.data.messages.map((m) => m.wamId).filter(Boolean));
+      const touchedPhones = new Set<string>();
+
+      for (const msg of params.messages) {
+        if (!msg.phone || !msg.body) continue;
+        const phone = this.normalizePhone(msg.phone);
+        if (msg.wamId && existingWamIds.has(msg.wamId)) continue;
+        if (msg.wamId) existingWamIds.add(msg.wamId);
+
+        const normalizedMsg: ChatMessage = { ...msg, phone };
+        this.data.messages.push(normalizedMsg);
+        messagesImported += 1;
+        touchedPhones.add(phone);
+
+        if (!this.data.sessions[phone]) {
+          this.data.sessions[phone] = {
+            phone,
+            name: `+${phone}`,
+            state: 'IDLE',
+            channel: msg.channel || 'baileys',
+            aiEnabled: true,
+            aiPausedUntil: null,
+            aiPausedIndefinitely: false,
+            handoverSource: null,
+            unreadCount: 0,
+            lastMessage: normalizedMsg.body.slice(0, 200),
+            lastMessageDirection: normalizedMsg.direction,
+            lastMessageAt: normalizedMsg.createdAt,
+            createdAt: normalizedMsg.createdAt,
+            context: {},
+          };
+          chatsImported += 1;
+        }
+      }
+
+      if (messagesImported > 0) {
+        // Keep chronological order across imported + live messages
+        this.data.messages.sort(
+          (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+        );
+        if (this.data.messages.length > 6000) {
+          this.data.messages = this.data.messages.slice(-6000);
+        }
+
+        // Refresh lastMessage preview on touched sessions from their newest message
+        for (const phone of touchedPhones) {
+          const session = this.data.sessions[phone];
+          if (!session) continue;
+          let latest: ChatMessage | null = null;
+          for (let i = this.data.messages.length - 1; i >= 0; i -= 1) {
+            if (this.data.messages[i].phone === phone) {
+              latest = this.data.messages[i];
+              break;
+            }
+          }
+          if (latest) {
+            const latestMs = new Date(latest.createdAt).getTime();
+            const curMs = new Date(session.lastMessageAt).getTime();
+            if (!session.lastMessage || latestMs >= curMs) {
+              session.lastMessage = latest.body.slice(0, 200);
+              session.lastMessageDirection = latest.direction;
+              session.lastMessageAt = latest.createdAt;
+            }
+          }
+        }
+      }
+    }
+
+    if (chatsImported > 0 || messagesImported > 0) {
+      this.persist();
+    }
+
+    return { chatsImported, messagesImported };
   }
 }
 

@@ -6,17 +6,23 @@ import {
   ThinkingLevel,
   Type,
 } from '@google/genai';
-import type { CustomerState, ToolCallLog } from '../lib/types';
+import type { CustomerState, InboundMediaAttachment, ToolCallLog } from '../lib/types';
 import {
   BIHAR_DISTRICTS,
   lookupLiveOrders,
   placeLiveOrder,
   searchLiveProducts,
+  type PlaceOrderResult,
 } from './ecommerce';
 import { resolveServerGeminiApiKey, storage } from './storage';
 
 let cachedGeminiClient: GoogleGenAI | null = null;
 let cachedGeminiKey = '';
+let cachedWorkingModel = '';
+let cachedConfiguredModel = '';
+let cachedUseOptionalParams = true;
+let cachedWorkingModelAt = 0;
+const MODEL_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 function getGeminiClient(): GoogleGenAI {
   const apiKey = resolveServerGeminiApiKey();
@@ -70,10 +76,12 @@ function formatFullError(err: unknown): string {
 
 function sanitizeBrandIdentity(text: string): string {
   // Never mention Google, Gemini, OpenAI, or ChatGPT in customer-facing WhatsApp replies
+  // Also convert Markdown **bold** into native WhatsApp *bold*
   return text
     .replace(/\b(google\s*gemini|google\s*ai|google|gemini|openai|chatgpt)\b/gi, 'Bihar Gramin Bazaar')
     .replace(/गूगल/g, 'बिहार ग्रामीण बाज़ार')
-    .replace(/जेमिनी/g, 'बिहार ग्रामीण बाज़ार');
+    .replace(/जेमिनी/g, 'बिहार ग्रामीण बाज़ार')
+    .replace(/\*\*([^*\n]+)\*\*/g, '*$1*');
 }
 
 export function buildHindiFallbackReply(customerName?: string): string {
@@ -88,14 +96,14 @@ export function buildHindiFallbackReply(customerName?: string): string {
 const searchProductsDeclaration: FunctionDeclaration = {
   name: 'search_products',
   description:
-    'Search live products from Bihar Gramin Bazaar catalog (https://bihargraminbazaar.com/api/products.php) matching Hindi/English/Hinglish keywords, category, or max price. Returns real prices, discounts, variants, stock status, and image URL.',
+    'Search LIVE up-to-date products from Bihar Gramin Bazaar website (https://bihargraminbazaar.com/api/products.php), including newly uploaded products, price updates, discounts, variants, stock status, and image URL. Set sortBy="newest" when customer asks for new arrivals, recent uploads, or latest products.',
   parameters: {
     type: Type.OBJECT,
     properties: {
       query: {
         type: Type.STRING,
         description:
-          'Product search query in Hindi, Hinglish, or English (e.g., "jute bag", "sattu", "honey", "kurta"). Leave empty to list featured products.',
+          'Product search query in Hindi, Hinglish, or English (e.g., "jute bag", "sattu", "honey", "face wash"). Leave empty to list featured or newest products.',
       },
       category: {
         type: Type.STRING,
@@ -105,6 +113,11 @@ const searchProductsDeclaration: FunctionDeclaration = {
         type: Type.NUMBER,
         description: 'Optional maximum price in INR.',
       },
+      sortBy: {
+        type: Type.STRING,
+        description:
+          'Optional sort order: "relevance" (default) or "newest" (use "newest" when customer asks for recently uploaded / latest / new products).',
+      },
     },
   },
 };
@@ -112,7 +125,7 @@ const searchProductsDeclaration: FunctionDeclaration = {
 const placeOrderDeclaration: FunctionDeclaration = {
   name: 'place_order',
   description:
-    'Place a real confirmed COD or UPI order directly on Bihar Gramin Bazaar (https://bihargraminbazaar.com/api/orders.php). ONLY call this tool AFTER the customer has explicitly confirmed product, quantity, full name, 10-digit phone number, village/street address, Bihar district, and 6-digit pincode.',
+    'Place ONE real confirmed COD or UPI order directly on Bihar Gramin Bazaar (https://bihargraminbazaar.com/api/orders.php). ONLY call this tool ONCE AFTER the customer has explicitly confirmed product, quantity, full name, 10-digit phone number, village/street address, Bihar district, and 6-digit pincode. NEVER call place_order again if an order is already confirmed for this customer (even if they ask to apply a coupon, change address, check status, or reply "ok/thanks/confirm")!',
   parameters: {
     type: Type.OBJECT,
     properties: {
@@ -212,15 +225,33 @@ function isWithinBusinessHours(start: string, end: string): boolean {
   }
 }
 
+function escapeRegExp(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function matchKeywordQuickReply(text: string): string | null {
-  const lower = text.trim().toLowerCase();
-  if (!lower || lower.length > 120) return null;
+  const cleaned = text.trim();
+  const lower = cleaned.toLowerCase();
+  // Only trigger canned FAQ quick-replies on very short pure-FAQ messages (never hijack real conversations,
+  // addresses, pincodes, or phone numbers — e.g. "pincode" contains "cod"!)
+  if (!lower || lower.length > 45) return null;
+  if (/\d{5,}/.test(lower)) return null; // contains pincode / phone / order number -> always let Gemini handle
+  const wordCount = lower.split(/\s+/).filter(Boolean).length;
+  if (wordCount > 5) return null;
+
   const rules = storage.getStore().settings.keywordReplies;
   for (const rule of rules) {
     if (!rule.enabled) continue;
     for (const kw of rule.keywords) {
       const normalizedKw = kw.trim().toLowerCase();
-      if (normalizedKw && lower.includes(normalizedKw)) {
+      if (!normalizedKw) continue;
+      const isAscii = /^[a-z0-9\s]+$/i.test(normalizedKw);
+      if (isAscii) {
+        const pattern = new RegExp(`(?<![a-z0-9])${escapeRegExp(normalizedKw)}(?![a-z0-9])`, 'i');
+        if (pattern.test(lower)) {
+          return rule.reply;
+        }
+      } else if (lower === normalizedKw || lower.includes(normalizedKw)) {
         return rule.reply;
       }
     }
@@ -252,6 +283,7 @@ export async function generateAiReply(params: {
   phone: string;
   customerName?: string;
   messageText: string;
+  mediaAttachments?: InboundMediaAttachment[];
   bypassPauseCheck?: boolean;
 }): Promise<GeminiReplyResult> {
   const startedAt = Date.now();
@@ -313,8 +345,10 @@ export async function generateAiReply(params: {
     }
   }
 
-  // Check instant keyword quick-reply for pure FAQ messages (when not mid-order)
-  if (session.state !== 'ORDER_PLACING') {
+  const hasMedia = Boolean(params.mediaAttachments && params.mediaAttachments.length > 0);
+
+  // Check instant keyword quick-reply for pure FAQ text messages (never when mid-order or when photo/voice is attached)
+  if (!hasMedia && session.state !== 'ORDER_PLACING') {
     const quickReply = matchKeywordQuickReply(params.messageText);
     if (quickReply) {
       return {
@@ -365,6 +399,47 @@ export async function generateAiReply(params: {
     pushTurn('user', latestText);
   }
 
+  // Attach incoming customer Photos & Voice Messages directly as Gemini multimodal inlineData parts
+  const mediaAttachments = (params.mediaAttachments || []).slice(0, 3);
+  if (mediaAttachments.length > 0) {
+    const tailTurn = contents[contents.length - 1];
+    if (tailTurn && tailTurn.role === 'user') {
+      const multimodalParts: Part[] = [...(tailTurn.parts || [])];
+      let hasImage = false;
+      let hasAudio = false;
+      for (const att of mediaAttachments) {
+        if (!att.base64) continue;
+        const cleanMime = (att.mimeType || (att.kind === 'image' ? 'image/jpeg' : 'audio/ogg'))
+          .split(';')[0]
+          .trim();
+        multimodalParts.push({
+          inlineData: {
+            mimeType: cleanMime,
+            data: att.base64,
+          },
+        });
+        if (att.kind === 'image') hasImage = true;
+        if (att.kind === 'audio') hasAudio = true;
+      }
+
+      const guidanceLines: string[] = [];
+      if (hasImage) {
+        guidanceLines.push(
+          '[ग्राहक ने यह फोटो भेजा है। फोटो को ध्यान से देखें — चाहे कोई प्रोडक्ट हो, स्क्रीनशॉट हो, लिखा हुआ पता/ऑर्डर हो, या डैमेज फोटो हो। अगर यह किसी प्रोडक्ट की फोटो है तो search_products चलाकर हमारे कैटलॉग से मिलता-जुलता प्रोडक्ट, ताज़ा कीमत और उपलब्धता बताएँ।]'
+        );
+      }
+      if (hasAudio) {
+        guidanceLines.push(
+          '[ग्राहक ने यह वॉइस मैसेज (Voice Note) भेजा है। इसे ध्यान से सुनें — चाहे हिंदी, Hinglish, English, मैथिली या भोजपुरी/बिहारी में हो — और ग्राहक जो पूछ रहा है उसका सीधा, छोटा और सही जवाब उसी भाषा में दें। ज़रूरत हो तो search_products / place_order / check_order_status टूल चलाएँ।]'
+        );
+      }
+      if (guidanceLines.length > 0) {
+        multimodalParts.push({ text: guidanceLines.join('\n') });
+      }
+      tailTurn.parts = multimodalParts;
+    }
+  }
+
   const ai = getGeminiClient();
   const rawConfiguredModel = (aiSettings.model || '').trim();
   const isRetiredModel =
@@ -374,7 +449,11 @@ export async function generateAiReply(params: {
     rawConfiguredModel === 'gemini-pro';
   const modelName = isRetiredModel ? 'gemini-4-hydrogen' : rawConfiguredModel;
 
-  const sessionContextNote = `\n\n[वर्तमान ग्राहक संदर्भ]:\n- WhatsApp फोन: +${phone}\n- ग्राहक नाम: ${session.name}\n- वर्तमान स्थिति (State): ${session.state}\n- पिछला देखा गया उत्पाद: ${session.context.lastProductName || 'कोई नहीं'} (ID: ${session.context.lastProductId || 'N/A'})\n- पिछला ऑर्डर ID: ${session.context.lastOrderId || 'कोई नहीं'}`;
+  const recentOrderWarning = session.context.lastOrderId
+    ? `\n- ⚠️ महत्वपूर्ण चेतावनी: इस ग्राहक का ऑर्डर *${session.context.lastOrderId}*${session.context.lastOrderProductName ? ` (${session.context.lastOrderProductName})` : ''} पहले से दर्ज हो चुका है। दोबारा place_order टूल *कभी न चलाएँ* (कूपन लगाने, पता बदलने, या "ok/thanks/confirm" बोलने पर भी नहीं) — जब तक ग्राहक साफ-साफ "एक और नया ऑर्डर करना है" न बोले।`
+    : '';
+
+  const sessionContextNote = `\n\n[वर्तमान ग्राहक संदर्भ]:\n- WhatsApp फोन: +${phone}\n- ग्राहक नाम: ${session.name}\n- वर्तमान स्थिति (State): ${session.state}\n- पिछला देखा गया उत्पाद: ${session.context.lastProductName || 'कोई नहीं'} (ID: ${session.context.lastProductId || 'N/A'})\n- पिछला ऑर्डर ID: ${session.context.lastOrderId || 'कोई नहीं'}${recentOrderWarning}`;
 
   const systemInstruction = `${aiSettings.systemPrompt}${sessionContextNote}`;
 
@@ -416,11 +495,23 @@ export async function generateAiReply(params: {
   };
 
   // Ordered active free-tier fallback list (never uses deprecated 1.5/2.0/2.5 models)
+  // Put the last known fast working model first so every subsequent customer gets instant attempt #1 replies!
+  const isCacheValid =
+    Boolean(cachedWorkingModel) &&
+    cachedConfiguredModel === modelName &&
+    Date.now() - cachedWorkingModelAt < MODEL_CACHE_TTL_MS;
+
   const candidateModels = Array.from(
-    new Set([modelName, 'gemini-4-hydrogen', 'gemini-3.8-flash', 'gemini-3.1-flash-lite'])
+    new Set([
+      ...(isCacheValid ? [cachedWorkingModel] : []),
+      modelName,
+      'gemini-4-hydrogen',
+      'gemini-3.8-flash',
+      'gemini-3.1-flash-lite',
+    ])
   );
   let activeModel = candidateModels[0];
-  let useOptionalParams = true;
+  let useOptionalParams = isCacheValid ? cachedUseOptionalParams : true;
 
   const callModelSafely = async (turnContents: Content[]) => {
     let lastError: unknown;
@@ -429,39 +520,70 @@ export async function generateAiReply(params: {
     for (let i = startIdx; i < candidateModels.length; i += 1) {
       const candidate = candidateModels[i];
       try {
-        const res = await ai.models.generateContent({
-          model: candidate,
-          contents: turnContents,
-          config: buildConfig(candidate, useOptionalParams),
-        });
+        const res = await withTimeout(
+          ai.models.generateContent({
+            model: candidate,
+            contents: turnContents,
+            config: buildConfig(candidate, useOptionalParams),
+          }),
+          12_000,
+          `gemini:${candidate}`
+        );
         activeModel = candidate;
+        cachedWorkingModel = candidate;
+        cachedConfiguredModel = modelName;
+        cachedUseOptionalParams = useOptionalParams;
+        cachedWorkingModelAt = Date.now();
         return res;
       } catch (err) {
         lastError = err;
         const msg = formatFullError(err).toLowerCase();
 
         // If thinkingConfig or temperature was rejected by this model, retry cleanly with minimal config
-        if (useOptionalParams && (msg.includes('thinking') || msg.includes('temperature') || msg.includes('invalid_argument') || msg.includes('400'))) {
+        if (
+          useOptionalParams &&
+          (msg.includes('thinking') ||
+            msg.includes('temperature') ||
+            msg.includes('invalid_argument') ||
+            msg.includes('400'))
+        ) {
           try {
-            const retryRes = await ai.models.generateContent({
-              model: candidate,
-              contents: turnContents,
-              config: buildConfig(candidate, false),
-            });
+            const retryRes = await withTimeout(
+              ai.models.generateContent({
+                model: candidate,
+                contents: turnContents,
+                config: buildConfig(candidate, false),
+              }),
+              12_000,
+              `gemini:${candidate}:minimal`
+            );
             activeModel = candidate;
             useOptionalParams = false;
+            cachedWorkingModel = candidate;
+            cachedConfiguredModel = modelName;
+            cachedUseOptionalParams = false;
+            cachedWorkingModelAt = Date.now();
             return retryRes;
           } catch (retryErr) {
             lastError = retryErr;
           }
         }
 
+        // Invalidate cached model if the cached candidate failed
+        if (candidate === cachedWorkingModel) {
+          cachedWorkingModel = '';
+        }
+
         // If API key is invalid/unauthorized, fail immediately rather than trying other models
         const retryMsg = formatFullError(lastError).toLowerCase();
-        if (retryMsg.includes('api_key_invalid') || retryMsg.includes('permission_denied') || retryMsg.includes('403')) {
+        if (
+          retryMsg.includes('api_key_invalid') ||
+          retryMsg.includes('permission_denied') ||
+          retryMsg.includes('403')
+        ) {
           throw lastError;
         }
-        // Otherwise (404 NOT_FOUND / 503 overloaded / 429), fall through to next active model
+        // Otherwise (404 NOT_FOUND / 503 overloaded / 429 / timeout), fall through to next active model
       }
     }
 
@@ -469,7 +591,45 @@ export async function generateAiReply(params: {
   };
 
   try {
-    let response = await callModelSafely(contents);
+    let response;
+    try {
+      response = await callModelSafely(contents);
+    } catch (initialErr) {
+      // Smart fallback for WhatsApp voice notes: if multimodal audio failed directly on the chat model,
+      // transcribe with gemini-3.5-transcribe first and retry cleanly as text!
+      const audioAttachment = mediaAttachments.find((a) => a.kind === 'audio' && a.base64);
+      if (audioAttachment) {
+        const cleanMime = (audioAttachment.mimeType || 'audio/ogg').split(';')[0].trim();
+        const transcriptRes = await withTimeout(
+          ai.models.generateContent({
+            model: 'gemini-3.5-transcribe',
+            contents: {
+              parts: [
+                { inlineData: { mimeType: cleanMime, data: audioAttachment.base64 } },
+                { text: 'Transcribe this WhatsApp voice message accurately in its original language (Hindi, Hinglish, English, Maithili, or Bhojpuri).' },
+              ],
+            },
+          }),
+          12_000,
+          'gemini:transcribe'
+        );
+        const transcript = (transcriptRes.text || '').trim();
+        if (transcript) {
+          const tail = contents[contents.length - 1];
+          if (tail && tail.role === 'user') {
+            tail.parts = [
+              { text: `${latestText}\n[Voice Message Transcript]: ${transcript}` },
+            ];
+          }
+          response = await callModelSafely(contents);
+        } else {
+          throw initialErr;
+        }
+      } else {
+        throw initialErr;
+      }
+    }
+    let placedOrderInTurn: PlaceOrderResult | null = null;
 
     // Multi-turn tool execution loop (up to 4 tool steps)
     let loops = 0;
@@ -490,14 +650,16 @@ export async function generateAiReply(params: {
         if (call.name === 'search_products') {
           nextState = 'BROWSING';
           try {
+            const sortBy = args.sortBy === 'newest' ? 'newest' : 'relevance';
             const results = await withTimeout(
               searchLiveProducts({
                 query: typeof args.query === 'string' ? args.query : undefined,
                 category: typeof args.category === 'string' ? args.category : undefined,
                 maxPrice: typeof args.maxPrice === 'number' ? args.maxPrice : undefined,
-                limit: 5,
+                sortBy,
+                limit: 6,
               }),
-              6000,
+              7000,
               'search_products'
             );
 
@@ -523,9 +685,10 @@ export async function generateAiReply(params: {
               });
             }
 
-            summary = `Found ${results.length} products`;
+            summary = `Found ${results.length} live products${sortBy === 'newest' ? ' (newest)' : ''}`;
             toolOutput = {
               count: results.length,
+              syncedAt: store.lastSyncAt,
               products: results.map((p) => ({
                 id: p.id,
                 sku: p.sku,
@@ -539,6 +702,7 @@ export async function generateAiReply(params: {
                 category: p.category,
                 deliveryDays: p.deliveryDays,
                 image: p.image,
+                createdAt: p.createdAt,
                 colors: p.colorVariants?.map((c) => c.name) || [],
                 sizes: p.sizeVariants?.map((s) => s.label || s.size).filter(Boolean) || [],
               })),
@@ -562,50 +726,80 @@ export async function generateAiReply(params: {
           }
         } else if (call.name === 'place_order') {
           nextState = 'ORDER_PLACING';
-          try {
-            const orderResult = await withTimeout(
-              placeLiveOrder({
-                productId: typeof args.productId === 'string' ? args.productId : session.context.lastProductId,
-                productName:
-                  typeof args.productName === 'string' ? args.productName : session.context.lastProductName,
-                quantity: Number(args.quantity || 1),
-                selectedColor: typeof args.selectedColor === 'string' ? args.selectedColor : undefined,
-                selectedSize: typeof args.selectedSize === 'string' ? args.selectedSize : undefined,
-                customerName: String(args.customerName || session.name),
-                phone: String(args.phone || phone),
-                streetOrVillage: String(args.streetOrVillage || ''),
-                district: String(args.district || ''),
-                pincode: String(args.pincode || ''),
-                paymentMethod: args.paymentMethod === 'UPI' ? 'UPI' : 'COD',
-                couponCode: typeof args.couponCode === 'string' ? args.couponCode : undefined,
-              }),
-              8000,
-              'place_order'
+          const explicitRepeatIntent =
+            /(ek aur|aur ek|dusra order|doosra order|naya order|new order|second order|another order|2nd order|phir se order|dobara order|order again|एक और|दूसरा ऑर्डर|नया ऑर्डर)/i.test(
+              params.messageText
             );
 
-            if (orderResult.success && orderResult.orderId) {
-              nextState = 'TRACKING';
-              storage.upsertSession(phone, {
-                state: 'TRACKING',
-                name: String(args.customerName || session.name),
-                context: {
-                  lastOrderId: orderResult.orderId,
-                  district: String(args.district || ''),
-                },
-              });
-            }
-
-            summary = orderResult.success
-              ? `Order confirmed: ${orderResult.orderId}`
-              : `Order failed: ${orderResult.message}`;
-            toolOutput = orderResult;
-          } catch (toolErr) {
-            const toolErrMsg = formatFullError(toolErr);
-            summary = `Order API timeout/error (${toolErrMsg})`;
+          // Hard single-order guard: never submit place_order more than once in the same turn
+          if (placedOrderInTurn && placedOrderInTurn.success) {
+            summary = `Duplicate place_order blocked (already confirmed: ${placedOrderInTurn.orderId})`;
             toolOutput = {
-              success: false,
-              message: `Store order API temporarily unreachable (${toolErrMsg}). Ask customer to confirm or call +91 9472258022.`,
+              ...placedOrderInTurn,
+              alreadyPlaced: true,
+              message: `Order ${placedOrderInTurn.orderId} is already confirmed. Share this single Order ID with the customer without placing another order.`,
             };
+          } else {
+            try {
+              const targetProductId =
+                typeof args.productId === 'string' ? args.productId : session.context.lastProductId;
+              const targetProductName =
+                typeof args.productName === 'string'
+                  ? args.productName
+                  : session.context.lastProductName;
+
+              const orderResult = await withTimeout(
+                placeLiveOrder({
+                  productId: targetProductId,
+                  productName: targetProductName,
+                  quantity: Number(args.quantity || 1),
+                  selectedColor: typeof args.selectedColor === 'string' ? args.selectedColor : undefined,
+                  selectedSize: typeof args.selectedSize === 'string' ? args.selectedSize : undefined,
+                  customerName: String(args.customerName || session.name),
+                  phone: String(args.phone || phone),
+                  streetOrVillage: String(args.streetOrVillage || ''),
+                  district: String(args.district || ''),
+                  pincode: String(args.pincode || ''),
+                  paymentMethod: args.paymentMethod === 'UPI' ? 'UPI' : 'COD',
+                  couponCode: typeof args.couponCode === 'string' ? args.couponCode : undefined,
+                  allowRepeatOrder: explicitRepeatIntent,
+                }),
+                16_000,
+                'place_order'
+              );
+
+              if (orderResult.success && orderResult.orderId) {
+                placedOrderInTurn = orderResult;
+                // Do not attach a slow product image card on order confirmation replies
+                matchedProductCard = undefined;
+                nextState = 'TRACKING';
+                storage.upsertSession(phone, {
+                  state: 'TRACKING',
+                  name: String(args.customerName || session.name),
+                  context: {
+                    lastOrderId: orderResult.orderId,
+                    lastOrderProductId: targetProductId,
+                    lastOrderProductName: targetProductName,
+                    lastOrderAt: new Date().toISOString(),
+                    district: String(args.district || ''),
+                  },
+                });
+              }
+
+              summary = orderResult.success
+                ? orderResult.alreadyPlaced
+                  ? `Duplicate blocked — existing order: ${orderResult.orderId}`
+                  : `Order confirmed: ${orderResult.orderId}`
+                : `Order failed: ${orderResult.message}`;
+              toolOutput = { ...orderResult };
+            } catch (toolErr) {
+              const toolErrMsg = formatFullError(toolErr);
+              summary = `Order API timeout/error (${toolErrMsg})`;
+              toolOutput = {
+                success: false,
+                message: `Store order API temporarily unreachable (${toolErrMsg}). Ask customer to confirm or call +91 9472258022.`,
+              };
+            }
           }
         } else if (call.name === 'check_order_status') {
           nextState = 'TRACKING';

@@ -4,7 +4,12 @@ import type { Boom } from '@hapi/boom';
 import type { WAMessage, WASocket, proto } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import QRCode from 'qrcode';
-import type { BaileysConnectionStatus, BaileysStateSnapshot } from '../lib/types';
+import type {
+  BaileysConnectionStatus,
+  BaileysStateSnapshot,
+  ChatMessage,
+  InboundMediaAttachment,
+} from '../lib/types';
 import { flushRemoteBackupNow, scheduleRemoteBackup } from './remote-backup';
 import { BAILEYS_AUTH_DIR, storage } from './storage';
 
@@ -28,6 +33,8 @@ export interface BaileysInboundEvent {
   altJid?: string;
   customerName: string;
   body: string;
+  messageType?: 'text' | 'image' | 'audio';
+  media?: InboundMediaAttachment;
   timestamp: string;
 }
 
@@ -45,6 +52,7 @@ type StatusListener = (snapshot: BaileysStateSnapshot) => void;
 type LogListener = (entry: ReturnType<typeof storage.addChannelLog>) => void;
 type InboundListener = (event: BaileysInboundEvent) => Promise<void>;
 type PhoneOutgoingListener = (event: BaileysPhoneOutgoingEvent) => Promise<void>;
+type HistorySyncListener = (summary: { chatsImported: number; messagesImported: number }) => void;
 
 class BaileysManager {
   private sock: WASocket | null = null;
@@ -62,11 +70,14 @@ class BaileysManager {
   private intentionalDisconnect = false;
   private pairingModeActive = false;
   private cachedVersion: [number, number, number] | undefined;
+  private seenWamIds: Set<string> = new Set();
+  private contactNames: Map<string, string> = new Map();
 
   private statusListeners: Set<StatusListener> = new Set();
   private logListeners: Set<LogListener> = new Set();
   private inboundListener: InboundListener | null = null;
   private phoneOutgoingListener: PhoneOutgoingListener | null = null;
+  private historySyncListener: HistorySyncListener | null = null;
 
   public onStatusChange(fn: StatusListener): () => void {
     this.statusListeners.add(fn);
@@ -84,6 +95,10 @@ class BaileysManager {
 
   public setPhoneOutgoingHandler(fn: PhoneOutgoingListener): void {
     this.phoneOutgoingListener = fn;
+  }
+
+  public setHistorySyncHandler(fn: HistorySyncListener): void {
+    this.historySyncListener = fn;
   }
 
   public getSnapshot(): BaileysStateSnapshot {
@@ -246,7 +261,7 @@ class BaileysManager {
         browser: Browsers.macOS('Chrome'),
         markOnlineOnConnect: true,
         syncFullHistory: false,
-        shouldSyncHistoryMessage: () => false,
+        shouldSyncHistoryMessage: () => true,
         connectTimeoutMs: 60_000,
         defaultQueryTimeoutMs: 60_000,
         keepAliveIntervalMs: 25_000,
@@ -382,11 +397,70 @@ class BaileysManager {
         }
       });
 
-      sock.ev.on('messages.upsert', async (event) => {
-        if (event.type !== 'notify') return;
-        for (const msg of event.messages) {
-          await this.handleIncomingMessage(msg);
+      // Sync all connected WhatsApp contacts, chats & recent message history into the CRM Inbox (NEVER triggers AI)
+      sock.ev.on('contacts.upsert', (contacts) => {
+        this.importContactsBatch(contacts);
+      });
+
+      sock.ev.on('contacts.update', (contacts) => {
+        this.importContactsBatch(contacts);
+      });
+
+      sock.ev.on('chats.upsert', (chats) => {
+        this.importChatsBatch(chats);
+      });
+
+      sock.ev.on('chats.update', (chats) => {
+        this.importChatsBatch(chats);
+      });
+
+      sock.ev.on('messaging-history.set', (history) => {
+        try {
+          if (history.contacts && history.contacts.length > 0) {
+            this.importContactsBatch(history.contacts);
+          }
+          const chatItems = (history.chats || [])
+            .map((c) => this.mapChatRecord(c))
+            .filter((x): x is NonNullable<typeof x> => Boolean(x));
+          const msgItems = (history.messages || [])
+            .map((m) => this.mapHistoricalMessage(m))
+            .filter((x): x is ChatMessage => Boolean(x));
+
+          const summary = storage.importWhatsAppHistory({
+            chats: chatItems,
+            messages: msgItems,
+          });
+          if (summary.chatsImported > 0 || summary.messagesImported > 0) {
+            this.log(
+              'success',
+              `Synced connected WhatsApp chats into Live Inbox: ${summary.chatsImported} chats, ${summary.messagesImported} messages.`
+            );
+            this.historySyncListener?.(summary);
+          }
+        } catch {
+          // keep history sync resilient
         }
+      });
+
+      sock.ev.on('messages.upsert', (event) => {
+        if (event.type === 'append') {
+          // Historical/synced messages pushed by WhatsApp -> display in CRM Inbox silently (NEVER trigger AI)
+          const historical = event.messages
+            .map((m) => this.mapHistoricalMessage(m))
+            .filter((x): x is ChatMessage => Boolean(x));
+          if (historical.length > 0) {
+            const summary = storage.importWhatsAppHistory({ messages: historical });
+            if (summary.chatsImported > 0 || summary.messagesImported > 0) {
+              this.historySyncListener?.(summary);
+            }
+          }
+          return;
+        }
+        if (event.type !== 'notify') return;
+        // Process real-time incoming messages from multiple numbers concurrently (never block Phone B behind Phone A)
+        void Promise.allSettled(
+          event.messages.map((msg) => this.handleIncomingMessage(msg))
+        );
       });
 
       if (options?.waitForQrMs) {
@@ -483,19 +557,241 @@ class BaileysManager {
     }
   }
 
-  private extractTextBody(message: proto.IMessage | null | undefined): string {
-    if (!message) return '';
-    if (message.conversation) return message.conversation;
-    if (message.extendedTextMessage?.text) return message.extendedTextMessage.text;
-    if (message.imageMessage?.caption) return message.imageMessage.caption;
-    if (message.videoMessage?.caption) return message.videoMessage.caption;
-    if (message.buttonsResponseMessage?.selectedDisplayText) {
-      return message.buttonsResponseMessage.selectedDisplayText;
+  private unwrapMessage(
+    message: proto.IMessage | null | undefined
+  ): proto.IMessage | null | undefined {
+    let cur = message;
+    for (let depth = 0; depth < 4 && cur; depth += 1) {
+      if (cur.ephemeralMessage?.message) {
+        cur = cur.ephemeralMessage.message;
+      } else if (cur.viewOnceMessage?.message) {
+        cur = cur.viewOnceMessage.message;
+      } else if (cur.viewOnceMessageV2?.message) {
+        cur = cur.viewOnceMessageV2.message;
+      } else if (cur.viewOnceMessageV2Extension?.message) {
+        cur = cur.viewOnceMessageV2Extension.message;
+      } else if (cur.documentWithCaptionMessage?.message) {
+        cur = cur.documentWithCaptionMessage.message;
+      } else {
+        break;
+      }
     }
-    if (message.listResponseMessage?.title) {
-      return message.listResponseMessage.title;
+    return cur;
+  }
+
+  private extractMessageContent(message: proto.IMessage | null | undefined): {
+    body: string;
+    mediaKind?: 'image' | 'audio';
+    mimeType?: string;
+  } {
+    const unwrapped = this.unwrapMessage(message);
+    if (!unwrapped) return { body: '' };
+
+    if (unwrapped.conversation) return { body: unwrapped.conversation.trim() };
+    if (unwrapped.extendedTextMessage?.text) {
+      return { body: unwrapped.extendedTextMessage.text.trim() };
     }
-    return '';
+    if (unwrapped.imageMessage) {
+      const caption = (unwrapped.imageMessage.caption || '').trim();
+      const mimeType = (unwrapped.imageMessage.mimetype || 'image/jpeg').split(';')[0].trim();
+      return {
+        body: caption || '[Photo bheja gaya]',
+        mediaKind: 'image',
+        mimeType,
+      };
+    }
+    if (unwrapped.audioMessage) {
+      const mimeType = (unwrapped.audioMessage.mimetype || 'audio/ogg').split(';')[0].trim();
+      return {
+        body: '[Voice message bheja gaya]',
+        mediaKind: 'audio',
+        mimeType,
+      };
+    }
+    if (unwrapped.videoMessage) {
+      const caption = (unwrapped.videoMessage.caption || '').trim();
+      return { body: caption ? `[Video] ${caption}` : '[Video bheja gaya]' };
+    }
+    if (unwrapped.documentMessage) {
+      const title = unwrapped.documentMessage.caption || unwrapped.documentMessage.fileName || 'Document';
+      return { body: `[Document] ${title}` };
+    }
+    if (unwrapped.buttonsResponseMessage?.selectedDisplayText) {
+      return { body: unwrapped.buttonsResponseMessage.selectedDisplayText.trim() };
+    }
+    if (unwrapped.listResponseMessage?.title) {
+      return { body: unwrapped.listResponseMessage.title.trim() };
+    }
+    return { body: '' };
+  }
+
+  private parseMessageTimestampSec(rawTs: unknown): number {
+    const parsedTs =
+      typeof rawTs === 'number'
+        ? rawTs
+        : typeof rawTs === 'object' &&
+          rawTs !== null &&
+          'toNumber' in rawTs &&
+          typeof (rawTs as { toNumber: () => number }).toNumber === 'function'
+        ? (rawTs as { toNumber: () => number }).toNumber()
+        : Number(rawTs);
+    return Number.isFinite(parsedTs) && parsedTs > 0 ? parsedTs : Math.floor(Date.now() / 1000);
+  }
+
+  private resolveJidToPhone(
+    rawJid: string | undefined | null,
+    altJid?: string | undefined | null
+  ): { rawJid: string; altJid?: string; phone: string } | null {
+    const cleanRaw = rawJid || '';
+    if (
+      !cleanRaw ||
+      cleanRaw === 'status@broadcast' ||
+      cleanRaw.endsWith('@g.us') ||
+      cleanRaw.endsWith('@broadcast') ||
+      cleanRaw.endsWith('@newsletter')
+    ) {
+      return null;
+    }
+
+    const cleanAlt = altJid && altJid.includes('@') ? altJid : undefined;
+    const extractDigits = (jid: string) =>
+      jid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '');
+
+    let phone = '';
+    if (cleanRaw.endsWith('@s.whatsapp.net')) {
+      const digits = extractDigits(cleanRaw);
+      if (digits.length >= 8) {
+        phone = storage.normalizePhone(digits);
+      }
+    } else if (cleanAlt && cleanAlt.endsWith('@s.whatsapp.net')) {
+      const altDigits = extractDigits(cleanAlt);
+      if (altDigits.length >= 8) {
+        phone = storage.normalizePhone(altDigits);
+      }
+    }
+
+    if (!phone) {
+      const rawDigits = extractDigits(cleanRaw);
+      if (rawDigits.length < 8) return null;
+      phone = cleanRaw.endsWith('@lid') ? rawDigits : storage.normalizePhone(rawDigits);
+    }
+
+    return { rawJid: cleanRaw, altJid: cleanAlt, phone };
+  }
+
+  private importContactsBatch(
+    contacts: Array<{ id?: string; lid?: string; name?: string | null; notify?: string | null; verifiedName?: string | null }>
+  ): void {
+    const mapped: Array<{ phone: string; rawJid?: string; altJid?: string; name?: string }> = [];
+    for (const c of contacts) {
+      const addressed = this.resolveJidToPhone(c.id, c.lid);
+      if (!addressed) continue;
+      const bestName = (c.name || c.notify || c.verifiedName || '').trim();
+      if (bestName) {
+        this.contactNames.set(addressed.phone, bestName);
+        mapped.push({
+          phone: addressed.phone,
+          rawJid: addressed.rawJid,
+          altJid: addressed.altJid,
+          name: bestName,
+        });
+      }
+    }
+    if (mapped.length > 0) {
+      storage.importWhatsAppHistory({ contacts: mapped });
+    }
+  }
+
+  private mapChatRecord(chat: {
+    id?: string | null;
+    name?: string | null;
+    conversationTimestamp?: unknown;
+    unreadCount?: number | null;
+  }): {
+    phone: string;
+    rawJid?: string;
+    altJid?: string;
+    name?: string;
+    lastMessageAt?: string;
+    unreadCount?: number;
+  } | null {
+    const addressed = this.resolveJidToPhone(chat.id);
+    if (!addressed) return null;
+    const bestName = (chat.name || this.contactNames.get(addressed.phone) || '').trim();
+    if (bestName) {
+      this.contactNames.set(addressed.phone, bestName);
+    }
+    const tsSec = chat.conversationTimestamp
+      ? this.parseMessageTimestampSec(chat.conversationTimestamp)
+      : 0;
+    return {
+      phone: addressed.phone,
+      rawJid: addressed.rawJid,
+      altJid: addressed.altJid,
+      name: bestName || undefined,
+      lastMessageAt: tsSec > 0 ? new Date(tsSec * 1000).toISOString() : undefined,
+      unreadCount: typeof chat.unreadCount === 'number' && chat.unreadCount > 0 ? chat.unreadCount : 0,
+    };
+  }
+
+  private importChatsBatch(
+    chats: Array<{
+      id?: string | null;
+      name?: string | null;
+      conversationTimestamp?: unknown;
+      unreadCount?: number | null;
+    }>
+  ): void {
+    const mapped = chats
+      .map((c) => this.mapChatRecord(c))
+      .filter((x): x is NonNullable<typeof x> => Boolean(x));
+    if (mapped.length > 0) {
+      const summary = storage.importWhatsAppHistory({ chats: mapped });
+      if (summary.chatsImported > 0) {
+        this.historySyncListener?.(summary);
+      }
+    }
+  }
+
+  private mapHistoricalMessage(msg: proto.IWebMessageInfo): ChatMessage | null {
+    const key = msg.key;
+    if (!key) return null;
+    const addressed = this.resolveAddressing(key);
+    if (!addressed) return null;
+
+    const extracted = this.extractMessageContent(msg.message);
+    if (!extracted.body) return null;
+
+    if (msg.pushName && !key.fromMe) {
+      this.contactNames.set(addressed.phone, msg.pushName);
+    }
+
+    const wamId = key.id || `hist-${addressed.phone}-${this.parseMessageTimestampSec(msg.messageTimestamp)}`;
+    const tsSec = this.parseMessageTimestampSec(msg.messageTimestamp);
+    const fromMe = Boolean(key.fromMe);
+
+    return {
+      id: `msg-hist-${wamId}`,
+      wamId,
+      phone: addressed.phone,
+      direction: fromMe ? 'OUTBOUND' : 'INBOUND',
+      senderType: fromMe
+        ? storage.isBotSentMessageId(wamId)
+          ? 'AI'
+          : 'HUMAN'
+        : 'CUSTOMER',
+      origin: fromMe
+        ? storage.isBotSentMessageId(wamId)
+          ? 'ai'
+          : 'phone'
+        : undefined,
+      messageType: extracted.mediaKind || 'text',
+      body: extracted.body,
+      channel: 'baileys',
+      mediaMimeType: extracted.mimeType,
+      status: fromMe ? 'SENT' : 'RECEIVED',
+      createdAt: new Date(tsSec * 1000).toISOString(),
+    };
   }
 
   private resolveAddressing(key: proto.IMessageKey): {
@@ -503,49 +799,62 @@ class BaileysManager {
     altJid?: string;
     phone: string;
   } | null {
-    const rawJid = key.remoteJid || '';
-    if (
-      !rawJid ||
-      rawJid === 'status@broadcast' ||
-      rawJid.endsWith('@g.us') ||
-      rawJid.endsWith('@broadcast') ||
-      rawJid.endsWith('@newsletter')
-    ) {
-      return null;
-    }
-
     const keyExt = key as proto.IMessageKey & {
       remoteJidAlt?: string;
       senderPn?: string;
       participantAlt?: string;
     };
     const altCandidate = keyExt.remoteJidAlt || keyExt.senderPn || keyExt.participantAlt || '';
-    const altJid = altCandidate && altCandidate.includes('@') ? altCandidate : undefined;
+    return this.resolveJidToPhone(key.remoteJid, altCandidate);
+  }
 
-    const extractDigits = (jid: string) =>
-      jid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '');
+  private async downloadInboundMedia(
+    msg: proto.IWebMessageInfo,
+    kind: 'image' | 'audio',
+    mimeType: string
+  ): Promise<InboundMediaAttachment | undefined> {
+    if (!this.sock) return undefined;
+    try {
+      const baileys = await loadBaileysModule();
+      const rawBuffer = await Promise.race<Buffer | null>([
+        baileys.downloadMediaMessage(
+          msg as WAMessage,
+          'buffer',
+          {},
+          {
+            logger: pino({ level: 'silent' }),
+            reuploadRequest: this.sock.updateMediaMessage,
+          }
+        ) as Promise<Buffer>,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 8500)),
+      ]);
 
-    let phone = '';
-    if (rawJid.endsWith('@s.whatsapp.net')) {
-      const digits = extractDigits(rawJid);
-      if (digits.length >= 8) {
-        phone = storage.normalizePhone(digits);
+      if (!rawBuffer || !Buffer.isBuffer(rawBuffer) || rawBuffer.length === 0) {
+        return undefined;
       }
-    } else if (altJid && altJid.endsWith('@s.whatsapp.net')) {
-      const altDigits = extractDigits(altJid);
-      if (altDigits.length >= 8) {
-        phone = storage.normalizePhone(altDigits);
+      if (rawBuffer.length > 5 * 1024 * 1024) {
+        this.log('warn', `Skipped oversized ${kind} (${Math.round(rawBuffer.length / 1024)} KB)`);
+        return undefined;
       }
-    }
 
-    if (!phone) {
-      const rawDigits = extractDigits(rawJid);
-      if (rawDigits.length < 8) return null;
-      // Preserve raw LID digits without prepending 91 when remoteJid is @lid
-      phone = rawJid.endsWith('@lid') ? rawDigits : storage.normalizePhone(rawDigits);
-    }
+      const cleanMime = (mimeType || (kind === 'image' ? 'image/jpeg' : 'audio/ogg'))
+        .split(';')[0]
+        .trim();
+      const mediaUrl = storage.saveInboundMedia(rawBuffer, cleanMime, kind);
 
-    return { rawJid, altJid, phone };
+      return {
+        kind,
+        mimeType: cleanMime,
+        base64: rawBuffer.toString('base64'),
+        mediaUrl,
+      };
+    } catch (err) {
+      this.log(
+        'warn',
+        `Could not download incoming ${kind}: ${err instanceof Error ? err.message : 'media error'}`
+      );
+      return undefined;
+    }
   }
 
   private async handleIncomingMessage(msg: proto.IWebMessageInfo): Promise<void> {
@@ -557,10 +866,20 @@ class BaileysManager {
 
     const { rawJid, altJid, phone } = addressed;
     const wamId = key.id || `baileys-${Date.now()}`;
-    const body = this.extractTextBody(msg.message).trim();
+
+    // Instant O(1) in-memory dedup before any async work to block rapid duplicate upsert events
+    if (this.seenWamIds.has(wamId)) return;
+    this.seenWamIds.add(wamId);
+    if (this.seenWamIds.size > 5000) {
+      const oldest = this.seenWamIds.values().next().value;
+      if (oldest) this.seenWamIds.delete(oldest);
+    }
+
+    const extracted = this.extractMessageContent(msg.message);
+    const body = extracted.body.trim();
     if (!body) return;
 
-    const tsSec = Number(msg.messageTimestamp || Math.floor(Date.now() / 1000));
+    const tsSec = this.parseMessageTimestampSec(msg.messageTimestamp);
 
     // PHONE REPLY DETECTION (fromMe === true):
     // If outgoing message ID was NOT sent by our AI bot / Dashboard server,
@@ -585,9 +904,42 @@ class BaileysManager {
 
     if (storage.hasMessageWithWamId(wamId)) return;
 
+    const customerName =
+      (msg.pushName || this.contactNames.get(phone) || '').trim() || `+${phone}`;
+    if (msg.pushName) {
+      this.contactNames.set(phone, msg.pushName);
+    }
+
+    // For stale/offline buffered messages (> 2 min old): still save silently into Live Inbox
+    // so all WhatsApp chats are visible on the website, but DO NOT trigger surprise AI replies!
+    const msgAgeMs = Date.now() - tsSec * 1000;
+    if (Number.isFinite(msgAgeMs) && msgAgeMs > 120_000) {
+      const histMsg = this.mapHistoricalMessage(msg);
+      if (histMsg) {
+        const summary = storage.importWhatsAppHistory({
+          chats: [{ phone, rawJid, altJid, name: customerName, lastMessageAt: histMsg.createdAt }],
+          messages: [histMsg],
+        });
+        if (summary.chatsImported > 0 || summary.messagesImported > 0) {
+          this.historySyncListener?.(summary);
+        }
+      }
+      return;
+    }
+
+    // Download incoming Photo or Voice Message so Gemini can see/hear it & Inbox can display/play it!
+    let media: InboundMediaAttachment | undefined;
+    if (extracted.mediaKind) {
+      media = await this.downloadInboundMedia(
+        msg,
+        extracted.mediaKind,
+        extracted.mimeType || (extracted.mediaKind === 'image' ? 'image/jpeg' : 'audio/ogg')
+      );
+    }
+
     this.log(
       'info',
-      `Incoming WhatsApp from ${msg.pushName || `+${phone}`} (${rawJid}${altJid ? ` -> +${phone}` : ''}): "${body.slice(0, 80)}"`
+      `Incoming WhatsApp ${extracted.mediaKind ? `[${extracted.mediaKind.toUpperCase()}] ` : ''}from ${customerName} (${rawJid}${altJid ? ` -> +${phone}` : ''}): "${body.slice(0, 80)}"`
     );
 
     if (this.inboundListener) {
@@ -596,8 +948,10 @@ class BaileysManager {
         phone,
         rawJid,
         altJid,
-        customerName: msg.pushName || `+${phone}`,
+        customerName,
         body,
+        messageType: extracted.mediaKind || 'text',
+        media,
         timestamp: new Date(tsSec * 1000).toISOString(),
       });
     }
@@ -661,19 +1015,37 @@ class BaileysManager {
     const fallbackJid =
       candidateAlt && candidateAlt !== primaryJid ? candidateAlt : undefined;
 
+    const fetchImageBufferFast = async (url: string): Promise<Buffer | null> => {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 3500);
+        const resp = await fetch(url, {
+          signal: controller.signal,
+          headers: { 'User-Agent': 'BGB-WhatsApp-CRM/1.0' },
+        });
+        clearTimeout(timer);
+        if (!resp.ok) return null;
+        const arr = await resp.arrayBuffer();
+        if (arr.byteLength === 0 || arr.byteLength > 5 * 1024 * 1024) return null;
+        return Buffer.from(arr);
+      } catch {
+        return null;
+      }
+    };
+
     const sendToJid = async (jid: string): Promise<WAMessage | undefined> => {
       if (!this.sock) throw new Error('WhatsApp socket disconnected');
       if (params.imageUrl) {
-        try {
-          return await this.sock.sendMessage(jid, {
-            image: { url: params.imageUrl },
-            caption: params.body,
-          });
-        } catch {
-          // If external image fetch fails, always fall back to delivering the text reply
-          return await this.sock.sendMessage(jid, {
-            text: params.body,
-          });
+        const imgBuf = await fetchImageBufferFast(params.imageUrl);
+        if (imgBuf) {
+          try {
+            return await this.sock.sendMessage(jid, {
+              image: imgBuf,
+              caption: params.body,
+            });
+          } catch {
+            // Fall through to fast text delivery
+          }
         }
       }
       return await this.sock.sendMessage(jid, {

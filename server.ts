@@ -104,18 +104,17 @@ async function bootstrap() {
         .catch(() => {});
     }, 3000);
 
-    // Scheduled background sync for products, orders & delivery stage WhatsApp alerts
+    // Scheduled background sync for live product uploads/updates, orders & delivery stage WhatsApp alerts (every 60s)
     const runScheduledSync = () => {
-      const intervalMins = Math.max(
-        1,
-        storage.getStore().settings.store.syncIntervalMinutes || 5
-      );
+      const configuredMins = storage.getStore().settings.store.syncIntervalMinutes || 1;
+      const intervalMs = Math.max(60_000, Math.min(configuredMins, 2) * 60 * 1000);
       setTimeout(async () => {
         try {
+          const prevProductCount = storage.getStore().productsCache.length;
           const summary = await syncStoreAndDetectTransitions(async (order) => {
             await messageRouter.sendOrderStageNotification(order);
           });
-          if (summary.transitions.length > 0) {
+          if (summary.transitions.length > 0 || summary.productsCount !== prevProductCount) {
             messageRouter.emit('ecommerce:synced', {
               ...summary,
               lastSyncAt: storage.getStore().lastSyncAt,
@@ -125,7 +124,7 @@ async function bootstrap() {
           // keep timer resilient
         }
         runScheduledSync();
-      }, intervalMins * 60 * 1000);
+      }, intervalMs);
     };
     runScheduledSync();
   });

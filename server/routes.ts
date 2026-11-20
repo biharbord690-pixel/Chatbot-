@@ -1,3 +1,5 @@
+import fs from 'fs';
+import path from 'path';
 import bcrypt from 'bcryptjs';
 import express, { NextFunction, Request, Response } from 'express';
 import jwt from 'jsonwebtoken';
@@ -50,7 +52,11 @@ function getTokenFromRequest(req: Request): string | null {
     return authHeader.slice(7).trim();
   }
   const cookies = parseCookies(req.headers.cookie);
-  return cookies[COOKIE_NAME] || null;
+  if (cookies[COOKIE_NAME]) {
+    return cookies[COOKIE_NAME];
+  }
+  const queryToken = typeof req.query.token === 'string' ? req.query.token.trim() : '';
+  return queryToken || null;
 }
 
 function requireAuth(req: AuthedRequest, res: Response, next: NextFunction): void {
@@ -451,6 +457,33 @@ export function createApiRouter(): express.Router {
     res.json({ session });
   });
 
+  // Serve downloaded inbound customer photos & voice notes for the Live Inbox
+  router.get('/media/:filename', (req, res) => {
+    const filename = String(req.params.filename || '').trim();
+    const fullPath = storage.resolveMediaFilePath(filename);
+    if (!fullPath) {
+      res.status(404).json({ error: 'Media file not found' });
+      return;
+    }
+    const ext = path.extname(fullPath).toLowerCase();
+    const mimeByExt: Record<string, string> = {
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.png': 'image/png',
+      '.webp': 'image/webp',
+      '.gif': 'image/gif',
+      '.ogg': 'audio/ogg',
+      '.mp3': 'audio/mpeg',
+      '.m4a': 'audio/mp4',
+      '.aac': 'audio/aac',
+      '.wav': 'audio/wav',
+      '.webm': 'audio/webm',
+    };
+    res.setHeader('Content-Type', mimeByExt[ext] || 'application/octet-stream');
+    res.setHeader('Cache-Control', 'private, max-age=86400');
+    fs.createReadStream(fullPath).pipe(res);
+  });
+
   // =========================================================================
   // LIVE GEMINI AI TOOL-CALLING TESTER (Uses real Gemini + real BGB APIs)
   // =========================================================================
@@ -604,10 +637,12 @@ export function createApiRouter(): express.Router {
   router.get('/ecommerce/products', async (req, res) => {
     const refresh = req.query.refresh === '1';
     if (refresh || storage.getStore().productsCache.length === 0) {
-      const result = await fetchLiveProducts();
+      const result = await fetchLiveProducts(refresh);
       res.json({
         products: result.products,
         source: result.source,
+        addedNames: result.addedNames,
+        updatedCount: result.updatedCount,
         error: result.error,
         lastSyncAt: storage.getStore().lastSyncAt,
       });

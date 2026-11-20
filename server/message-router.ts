@@ -1,14 +1,33 @@
 import type { proto } from '@whiskeysockets/baileys';
 import type { Server as SocketIOServer } from 'socket.io';
-import type { ChannelType, ChatMessage, StoreOrder, StoreProduct } from '../lib/types';
+import type {
+  ChannelType,
+  ChatMessage,
+  InboundMediaAttachment,
+  StoreOrder,
+  StoreProduct,
+} from '../lib/types';
 import { formatOrderStageNotification } from './ecommerce';
 import { generateAiReply } from './gemini-engine';
 import { storage } from './storage';
 import { baileysManager } from './whatsapp-baileys';
 import { sendMetaWhatsAppMessage } from './whatsapp-meta';
 
+interface PhoneQueueState {
+  pendingTexts: string[];
+  pendingMedia: InboundMediaAttachment[];
+  rawJid?: string;
+  altJid?: string;
+  customerName: string;
+  preferredChannel: ChannelType;
+  debounceTimer: NodeJS.Timeout | null;
+  processing: boolean;
+}
+
 class MessageRouter {
   private io: SocketIOServer | null = null;
+  private seenInboundWamIds: Set<string> = new Set();
+  private phoneQueues: Map<string, PhoneQueueState> = new Map();
 
   public attachSocketServer(io: SocketIOServer): void {
     this.io = io;
@@ -30,6 +49,8 @@ class MessageRouter {
         altJid: event.altJid,
         customerName: event.customerName,
         body: event.body,
+        messageType: event.messageType,
+        media: event.media,
         timestamp: event.timestamp,
       });
     });
@@ -46,10 +67,112 @@ class MessageRouter {
         messageKey: event.messageKey,
       });
     });
+
+    baileysManager.setHistorySyncHandler((summary) => {
+      this.io?.emit('chat:history_synced', summary);
+    });
   }
 
   public emit(event: string, payload: unknown): void {
     this.io?.emit(event, payload);
+  }
+
+  private enqueueAiReplyForPhone(params: {
+    phone: string;
+    rawJid?: string;
+    altJid?: string;
+    customerName: string;
+    messageText: string;
+    media?: InboundMediaAttachment;
+    preferredChannel: ChannelType;
+  }): void {
+    const existing = this.phoneQueues.get(params.phone);
+    if (existing) {
+      existing.pendingTexts.push(params.messageText);
+      if (params.media) existing.pendingMedia.push(params.media);
+      if (params.rawJid) existing.rawJid = params.rawJid;
+      if (params.altJid) existing.altJid = params.altJid;
+      if (params.customerName) existing.customerName = params.customerName;
+      existing.preferredChannel = params.preferredChannel;
+
+      // Reset brief coalescing timer if not already processing so rapid multi-bubble messages
+      // from the SAME customer combine into ONE accurate reply (never out-of-order double replies!)
+      if (!existing.processing) {
+        if (existing.debounceTimer) clearTimeout(existing.debounceTimer);
+        existing.debounceTimer = setTimeout(() => {
+          existing.debounceTimer = null;
+          void this.drainPhoneQueue(params.phone);
+        }, 700);
+      }
+      return;
+    }
+
+    const state: PhoneQueueState = {
+      pendingTexts: [params.messageText],
+      pendingMedia: params.media ? [params.media] : [],
+      rawJid: params.rawJid,
+      altJid: params.altJid,
+      customerName: params.customerName,
+      preferredChannel: params.preferredChannel,
+      debounceTimer: null,
+      processing: false,
+    };
+    this.phoneQueues.set(params.phone, state);
+
+    // Brief 700ms coalesce window per phone; DIFFERENT phones run 100% in parallel!
+    state.debounceTimer = setTimeout(() => {
+      state.debounceTimer = null;
+      void this.drainPhoneQueue(params.phone);
+    }, 700);
+  }
+
+  private async drainPhoneQueue(phone: string): Promise<void> {
+    const state = this.phoneQueues.get(phone);
+    if (!state || state.processing) return;
+
+    if (state.pendingTexts.length === 0 && state.pendingMedia.length === 0) {
+      this.phoneQueues.delete(phone);
+      return;
+    }
+
+    state.processing = true;
+    const mergedText = state.pendingTexts.splice(0, state.pendingTexts.length).join('\n').trim();
+    const mergedMedia = state.pendingMedia.splice(0, state.pendingMedia.length);
+
+    try {
+      if (mergedText || mergedMedia.length > 0) {
+        await this.triggerAiAutoReply({
+          phone,
+          rawJid: state.rawJid,
+          altJid: state.altJid,
+          customerName: state.customerName,
+          messageText: mergedText || '[Media bheja gaya]',
+          mediaAttachments: mergedMedia.length > 0 ? mergedMedia : undefined,
+          preferredChannel: state.preferredChannel,
+        });
+      }
+    } catch (err) {
+      const fullErr =
+        err instanceof Error ? err.message : typeof err === 'string' ? err : JSON.stringify(err);
+      const logEntry = storage.addChannelLog(
+        state.preferredChannel,
+        'error',
+        `AI auto-reply error for +${phone}: ${fullErr}`
+      );
+      this.io?.emit('wa:log', logEntry);
+    } finally {
+      state.processing = false;
+      if (state.pendingTexts.length > 0 || state.pendingMedia.length > 0) {
+        // Process any new messages that arrived from this customer while AI was replying
+        if (state.debounceTimer) clearTimeout(state.debounceTimer);
+        state.debounceTimer = setTimeout(() => {
+          state.debounceTimer = null;
+          void this.drainPhoneQueue(phone);
+        }, 350);
+      } else if (!state.debounceTimer) {
+        this.phoneQueues.delete(phone);
+      }
+    }
   }
 
   public async handleInboundMessage(params: {
@@ -60,14 +183,23 @@ class MessageRouter {
     altJid?: string;
     customerName: string;
     body: string;
+    messageType?: 'text' | 'image' | 'audio';
+    media?: InboundMediaAttachment;
     timestamp?: string;
   }): Promise<ChatMessage> {
     const phone = storage.normalizePhone(params.phone);
     const createdAt = params.timestamp || new Date().toISOString();
 
-    if (storage.hasMessageWithWamId(params.wamId)) {
+    if (params.wamId && (this.seenInboundWamIds.has(params.wamId) || storage.hasMessageWithWamId(params.wamId))) {
       const existing = storage.getStore().messages.find((m) => m.wamId === params.wamId);
       if (existing) return existing;
+    }
+    if (params.wamId) {
+      this.seenInboundWamIds.add(params.wamId);
+      if (this.seenInboundWamIds.size > 5000) {
+        const firstKey = this.seenInboundWamIds.values().next().value;
+        if (firstKey) this.seenInboundWamIds.delete(firstKey);
+      }
     }
 
     const session = storage.upsertSession(phone, {
@@ -83,9 +215,11 @@ class MessageRouter {
       phone,
       direction: 'INBOUND',
       senderType: 'CUSTOMER',
-      messageType: 'text',
+      messageType: params.messageType || 'text',
       body: params.body,
       channel: params.channel,
+      mediaUrl: params.media?.mediaUrl,
+      mediaMimeType: params.media?.mimeType,
       status: 'RECEIVED',
       createdAt,
     });
@@ -95,23 +229,16 @@ class MessageRouter {
       session: storage.getStore().sessions[phone] || session,
     });
 
-    // Run Gemini AI auto-reply asynchronously without blocking webhook ACK
-    this.triggerAiAutoReply({
+    // Enqueue per-phone: different customer numbers run 100% concurrently,
+    // while same-customer rapid messages coalesce & serialize cleanly!
+    this.enqueueAiReplyForPhone({
       phone,
       rawJid: params.rawJid || session.rawJid,
       altJid: params.altJid || session.altJid,
       customerName: params.customerName,
       messageText: params.body,
+      media: params.media,
       preferredChannel: params.channel,
-    }).catch((err) => {
-      const fullErr =
-        err instanceof Error ? err.message : typeof err === 'string' ? err : JSON.stringify(err);
-      const logEntry = storage.addChannelLog(
-        params.channel,
-        'error',
-        `AI auto-reply error for +${phone}: ${fullErr}`
-      );
-      this.io?.emit('wa:log', logEntry);
     });
 
     return inboundMsg;
@@ -264,6 +391,7 @@ class MessageRouter {
     altJid?: string;
     customerName: string;
     messageText: string;
+    mediaAttachments?: InboundMediaAttachment[];
     preferredChannel: ChannelType;
   }): Promise<void> {
     const typingJid = params.rawJid || params.altJid;
@@ -277,6 +405,7 @@ class MessageRouter {
         phone: params.phone,
         customerName: params.customerName,
         messageText: params.messageText,
+        mediaAttachments: params.mediaAttachments,
       });
     } finally {
       if (params.preferredChannel === 'baileys' && typingJid) {

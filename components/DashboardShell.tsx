@@ -283,10 +283,40 @@ export default function DashboardShell() {
       fetchOverviewAndLists();
     });
 
+    socket.on(
+      'chat:history_synced',
+      async (summary?: { chatsImported?: number; messagesImported?: number }) => {
+        try {
+          const chatsRes = await apiFetch('/api/chats');
+          if (chatsRes.ok) {
+            const ch = await chatsRes.json();
+            setSessions(ch.sessions || []);
+          }
+          if (selectedPhoneRef.current) {
+            const msgRes = await apiFetch(
+              `/api/chats/${encodeURIComponent(selectedPhoneRef.current)}/messages`
+            );
+            if (msgRes.ok) {
+              const md = await msgRes.json();
+              setMessages(md.messages || []);
+            }
+          }
+          if (summary && (summary.chatsImported || 0) > 0) {
+            showToast(
+              `Synced ${summary.chatsImported} WhatsApp chats & ${summary.messagesImported || 0} messages into Live Inbox`,
+              'success'
+            );
+          }
+        } catch {
+          // keep resilient
+        }
+      }
+    );
+
     return () => {
       socket.disconnect();
     };
-  }, [user, fetchOverviewAndLists]);
+  }, [user, fetchOverviewAndLists, showToast]);
 
   const loadThread = useCallback(async (phone: string) => {
     setSelectedPhone(phone);
@@ -673,6 +703,8 @@ export default function DashboardShell() {
               aiGlobalMode={settings?.ai.mode || 'AUTO_ON'}
               onChangeGlobalAiMode={handleChangeGlobalAiMode}
               onSelectPhone={loadThread}
+              onClearSelection={() => setSelectedPhone(null)}
+              onRefreshChats={() => void fetchOverviewAndLists()}
               onStartNewChat={handleStartNewChat}
               onSendMessage={handleSendMessage}
               onSendProductCard={handleSendProductCard}

@@ -63,6 +63,8 @@ export interface StoreProduct {
   highlights?: string[];
   colorVariants?: ProductColorVariant[];
   sizeVariants?: ProductSizeVariant[];
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 export interface OrderItem {
@@ -127,6 +129,9 @@ export interface ChatSession {
     lastProductId?: string;
     lastProductName?: string;
     lastOrderId?: string;
+    lastOrderProductId?: string;
+    lastOrderProductName?: string;
+    lastOrderAt?: string;
     district?: string;
   };
 }
@@ -137,6 +142,13 @@ export interface ToolCallLog {
   resultSummary: string;
 }
 
+export interface InboundMediaAttachment {
+  kind: 'image' | 'audio';
+  mimeType: string;
+  base64: string;
+  mediaUrl?: string;
+}
+
 export interface ChatMessage {
   id: string;
   wamId: string;
@@ -144,10 +156,11 @@ export interface ChatMessage {
   direction: 'INBOUND' | 'OUTBOUND';
   senderType: 'CUSTOMER' | 'AI' | 'HUMAN' | 'SYSTEM';
   origin?: 'dashboard' | 'phone' | 'ai' | 'system';
-  messageType: 'text' | 'product_card' | 'order_update';
+  messageType: 'text' | 'image' | 'audio' | 'product_card' | 'order_update';
   body: string;
   channel: ChannelType;
   mediaUrl?: string;
+  mediaMimeType?: string;
   productCard?: {
     id: string;
     name: string;

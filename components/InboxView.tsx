@@ -2,12 +2,16 @@
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ArrowLeft,
   Bot,
+  Image as ImageIcon,
   MessageSquare,
+  Mic,
   Package,
   PauseCircle,
   PlayCircle,
   Plus,
+  RefreshCw,
   Search,
   Send,
   ShoppingBag,
@@ -15,6 +19,7 @@ import {
   User,
   X,
 } from 'lucide-react';
+import { getStoredAuthToken } from '@/lib/api-client';
 import type {
   AiGlobalMode,
   ChatMessage,
@@ -33,11 +38,21 @@ interface InboxViewProps {
   aiGlobalMode: AiGlobalMode;
   onChangeGlobalAiMode: (mode: AiGlobalMode) => void;
   onSelectPhone: (phone: string) => void;
+  onClearSelection?: () => void;
+  onRefreshChats?: () => void;
   onStartNewChat: (phone: string, name: string) => Promise<void>;
   onSendMessage: (phone: string, body: string) => Promise<void>;
   onSendProductCard: (phone: string, productId: string, note?: string) => Promise<void>;
   onToggleChatAi: (phone: string, enabled: boolean) => Promise<void>;
   onNotifyOrder: (orderId: string) => Promise<void>;
+}
+
+function resolveAuthenticatedMediaUrl(url: string | undefined): string {
+  if (!url) return '';
+  if (!url.startsWith('/api/media/')) return url;
+  const token = getStoredAuthToken();
+  if (!token) return url;
+  return `${url}${url.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}`;
 }
 
 function isAiPaused(session: ChatSession, nowMs: number): boolean {
@@ -82,6 +97,8 @@ export default function InboxView({
   aiGlobalMode,
   onChangeGlobalAiMode,
   onSelectPhone,
+  onClearSelection,
+  onRefreshChats,
   onStartNewChat,
   onSendMessage,
   onSendProductCard,
@@ -101,6 +118,7 @@ export default function InboxView({
   const [showProductPicker, setShowProductPicker] = useState(false);
   const [productSearch, setProductSearch] = useState('');
   const [productNote, setProductNote] = useState('');
+  const [lightboxImageUrl, setLightboxImageUrl] = useState<string | null>(null);
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
 
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
@@ -179,19 +197,42 @@ export default function InboxView({
 
   return (
     <div className="h-[calc(100vh-124px)] min-h-[580px] bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden grid grid-cols-1 lg:grid-cols-12">
-      {/* Left Pane: Contact List */}
-      <aside className="lg:col-span-4 xl:col-span-3 border-b lg:border-b-0 lg:border-r border-slate-200 dark:border-slate-800 flex flex-col min-h-0">
+      {/* Left Pane: All Connected WhatsApp Conversations */}
+      <aside
+        className={`${
+          activeSession ? 'hidden lg:flex' : 'flex'
+        } lg:col-span-4 xl:col-span-3 border-b lg:border-b-0 lg:border-r border-slate-200 dark:border-slate-800 flex-col min-h-0`}
+      >
         <div className="p-3.5 border-b border-slate-200 dark:border-slate-800 space-y-2.5">
           <div className="flex items-center justify-between gap-2">
-            <h2 className="text-sm font-semibold text-slate-900 dark:text-white">Conversations</h2>
-            <button
-              type="button"
-              onClick={() => setShowNewChat((v) => !v)}
-              className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-xs font-medium flex items-center gap-1 whitespace-nowrap"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              New Chat
-            </button>
+            <div className="flex items-center gap-2 min-w-0">
+              <h2 className="text-sm font-semibold text-slate-900 dark:text-white truncate">
+                All WhatsApp Chats
+              </h2>
+              <span className="text-[11px] font-mono text-slate-500 dark:text-slate-400">
+                ({sessions.length})
+              </span>
+            </div>
+            <div className="flex items-center gap-1.5 shrink-0">
+              {onRefreshChats && (
+                <button
+                  type="button"
+                  onClick={onRefreshChats}
+                  title="Refresh synced WhatsApp chats"
+                  className="p-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-300"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setShowNewChat((v) => !v)}
+                className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-xs font-medium flex items-center gap-1 whitespace-nowrap"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                New
+              </button>
+            </div>
           </div>
 
           {showNewChat && (
@@ -320,33 +361,49 @@ export default function InboxView({
       </aside>
 
       {/* Center Pane: Real-time Chat Thread */}
-      <section className="lg:col-span-8 xl:col-span-6 flex flex-col min-h-0 bg-slate-50/50 dark:bg-[#0B1120]/60">
+      <section
+        className={`${
+          activeSession ? 'flex' : 'hidden lg:flex'
+        } lg:col-span-8 xl:col-span-6 flex-col min-h-0 bg-slate-50/50 dark:bg-[#0B1120]/60`}
+      >
         {!activeSession ? (
           <div className="flex-1 flex flex-col items-center justify-center p-8 text-center">
             <MessageSquare className="w-9 h-9 text-slate-300 dark:text-slate-700 mb-3" />
             <p className="text-sm font-medium text-slate-800 dark:text-slate-200">
-              Select a conversation to reply live
+              Select a conversation to view & reply live
             </p>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 max-w-sm">
-              Manual replies automatically pause Gemini AI for this customer during the human
-              handover cooldown window.
+              All connected WhatsApp chats, photos, voice messages, and AI replies appear here in
+              real time.
             </p>
           </div>
         ) : (
           <>
             {/* Chat Header with Human Handling Status & 1-Click AI Toggle */}
-            <div className="px-5 py-3.5 bg-white dark:bg-[#111827] border-b border-slate-200 dark:border-slate-800 space-y-2.5">
+            <div className="px-4 sm:px-5 py-3.5 bg-white dark:bg-[#111827] border-b border-slate-200 dark:border-slate-800 space-y-2.5">
               <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <h3 className="text-sm font-semibold text-slate-900 dark:text-white truncate">
-                      {activeSession.name}
-                    </h3>
-                    <span className="text-xs font-mono text-slate-500">+{activeSession.phone}</span>
+                <div className="flex items-center gap-2.5 min-w-0">
+                  {onClearSelection && (
+                    <button
+                      type="button"
+                      onClick={onClearSelection}
+                      aria-label="Back to all chats"
+                      className="lg:hidden p-1.5 -ml-1 rounded-lg border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
+                    >
+                      <ArrowLeft className="w-4 h-4" />
+                    </button>
+                  )}
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <h3 className="text-sm font-semibold text-slate-900 dark:text-white truncate">
+                        {activeSession.name}
+                      </h3>
+                      <span className="text-xs font-mono text-slate-500">+{activeSession.phone}</span>
+                    </div>
+                    <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                      State: {activeSession.state} · Channel: {activeSession.channel.toUpperCase()}
+                    </p>
                   </div>
-                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                    State: {activeSession.state} · Channel: {activeSession.channel.toUpperCase()}
-                  </p>
                 </div>
 
                 <div className="flex items-center gap-2 shrink-0">
@@ -560,6 +617,56 @@ export default function InboxView({
                           </div>
                         )}
 
+                        {msg.messageType === 'image' && (
+                          <div className="mb-2 space-y-1.5">
+                            {msg.mediaUrl ? (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setLightboxImageUrl(resolveAuthenticatedMediaUrl(msg.mediaUrl))
+                                }
+                                className="block rounded-lg overflow-hidden border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-900"
+                              >
+                                {/* eslint-disable-next-line @next/next/no-img-element */}
+                                <img
+                                  src={resolveAuthenticatedMediaUrl(msg.mediaUrl)}
+                                  alt="Customer photo"
+                                  className="w-full max-w-[260px] max-h-56 object-cover"
+                                  referrerPolicy="no-referrer"
+                                />
+                              </button>
+                            ) : (
+                              <div className="inline-flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400">
+                                <ImageIcon className="w-3.5 h-3.5" />
+                                <span>Photo attachment</span>
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        {msg.messageType === 'audio' && (
+                          <div className="mb-2 space-y-1.5">
+                            <div
+                              className={`inline-flex items-center gap-1.5 text-xs font-medium ${
+                                outbound
+                                  ? 'text-white/90'
+                                  : 'text-emerald-700 dark:text-emerald-400'
+                              }`}
+                            >
+                              <Mic className="w-3.5 h-3.5" />
+                              <span>Voice Message</span>
+                            </div>
+                            {msg.mediaUrl && (
+                              <audio
+                                controls
+                                preload="metadata"
+                                src={resolveAuthenticatedMediaUrl(msg.mediaUrl)}
+                                className="w-full min-w-[210px] max-w-[260px] h-9"
+                              />
+                            )}
+                          </div>
+                        )}
+
                         <p className="whitespace-pre-wrap leading-relaxed break-words">{msg.body}</p>
 
                         {msg.toolCalls && msg.toolCalls.length > 0 && (
@@ -710,6 +817,35 @@ export default function InboxView({
           </div>
         )}
       </aside>
+
+      {/* Inline Photo Lightbox Modal */}
+      {lightboxImageUrl && (
+        <div
+          className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4"
+          onClick={() => setLightboxImageUrl(null)}
+        >
+          <div
+            className="relative max-w-3xl max-h-[85vh] bg-slate-950 rounded-xl overflow-hidden border border-slate-800"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              type="button"
+              onClick={() => setLightboxImageUrl(null)}
+              aria-label="Close photo preview"
+              className="absolute top-3 right-3 p-1.5 rounded-lg bg-black/60 text-white hover:bg-black/80"
+            >
+              <X className="w-4 h-4" />
+            </button>
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={lightboxImageUrl}
+              alt="Customer photo preview"
+              className="max-w-full max-h-[82vh] object-contain"
+              referrerPolicy="no-referrer"
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }
