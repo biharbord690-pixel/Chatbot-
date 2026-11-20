@@ -11,7 +11,7 @@ import type {
   InboundMediaAttachment,
 } from '../lib/types';
 import { flushRemoteBackupNow, scheduleRemoteBackup } from './remote-backup';
-import { BAILEYS_AUTH_DIR, storage } from './storage';
+import { BAILEYS_AUTH_DIR, MEDIA_DIR, storage } from './storage';
 
 type BaileysModule = typeof import('@whiskeysockets/baileys');
 
@@ -72,6 +72,15 @@ class BaileysManager {
   private cachedVersion: [number, number, number] | undefined;
   private seenWamIds: Set<string> = new Set();
   private contactNames: Map<string, string> = new Map();
+  private lidToPhone: Map<string, string> = new Map();
+  private avatarCache: Map<
+    string,
+    { buffer: Buffer | null; mimeType: string; fetchedAt: number }
+  > = new Map();
+  private avatarInFlight: Map<
+    string,
+    Promise<{ buffer: Buffer; mimeType: string } | null>
+  > = new Map();
 
   private statusListeners: Set<StatusListener> = new Set();
   private logListeners: Set<LogListener> = new Set();
@@ -319,6 +328,7 @@ class BaileysManager {
             'success',
             `Connected to WhatsApp as ${this.connectedName}${this.connectedPhone ? ` (+${this.connectedPhone})` : ''}.`
           );
+          this.hydrateLidMappingsFromStore();
           // Immediately back up freshly linked session to remote vault (e.g. MilesWeb)
           void flushRemoteBackupNow('whatsapp_connected');
         }
@@ -638,6 +648,61 @@ class BaileysManager {
     return Number.isFinite(parsedTs) && parsedTs > 0 ? parsedTs : Math.floor(Date.now() / 1000);
   }
 
+  private hydrateLidMappingsFromStore(): void {
+    const sessions = Object.values(storage.getStore().sessions);
+    let mergedAny = false;
+    for (const s of sessions) {
+      const raw = s.rawJid || '';
+      const alt = s.altJid || '';
+      if (raw.endsWith('@lid') && alt.endsWith('@s.whatsapp.net')) {
+        const lidDigits = raw.split('@')[0].split(':')[0].replace(/[^0-9]/g, '');
+        const pnDigits = storage.normalizePhone(alt.split('@')[0].split(':')[0]);
+        if (lidDigits && pnDigits && lidDigits !== pnDigits) {
+          this.lidToPhone.set(lidDigits, pnDigits);
+          if (storage.mergeLidSessionIntoPhone(lidDigits, pnDigits)) {
+            mergedAny = true;
+          }
+        }
+      } else if (alt.endsWith('@lid') && raw.endsWith('@s.whatsapp.net')) {
+        const lidDigits = alt.split('@')[0].split(':')[0].replace(/[^0-9]/g, '');
+        const pnDigits = storage.normalizePhone(raw.split('@')[0].split(':')[0]);
+        if (lidDigits && pnDigits && lidDigits !== pnDigits) {
+          this.lidToPhone.set(lidDigits, pnDigits);
+          if (storage.mergeLidSessionIntoPhone(lidDigits, pnDigits)) {
+            mergedAny = true;
+          }
+        }
+      }
+    }
+    if (mergedAny) {
+      this.historySyncListener?.({ chatsImported: 1, messagesImported: 0 });
+    }
+  }
+
+  private rememberLidPair(jidA?: string | null, jidB?: string | null): void {
+    const a = jidA || '';
+    const b = jidB || '';
+    const extract = (j: string) => j.split('@')[0].split(':')[0].replace(/[^0-9]/g, '');
+
+    let lidDigits = '';
+    let pnDigits = '';
+    if (a.endsWith('@lid') && b.endsWith('@s.whatsapp.net')) {
+      lidDigits = extract(a);
+      pnDigits = storage.normalizePhone(extract(b));
+    } else if (b.endsWith('@lid') && a.endsWith('@s.whatsapp.net')) {
+      lidDigits = extract(b);
+      pnDigits = storage.normalizePhone(extract(a));
+    } else if (a.endsWith('@lid') && b && !b.includes('@')) {
+      lidDigits = extract(a);
+      pnDigits = storage.normalizePhone(b);
+    }
+
+    if (lidDigits && pnDigits && lidDigits !== pnDigits && pnDigits.length >= 10) {
+      this.lidToPhone.set(lidDigits, pnDigits);
+      storage.mergeLidSessionIntoPhone(lidDigits, pnDigits);
+    }
+  }
+
   private resolveJidToPhone(
     rawJid: string | undefined | null,
     altJid?: string | undefined | null
@@ -654,10 +719,14 @@ class BaileysManager {
     }
 
     const cleanAlt = altJid && altJid.includes('@') ? altJid : undefined;
+    this.rememberLidPair(cleanRaw, cleanAlt || altJid);
+
     const extractDigits = (jid: string) =>
       jid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '');
 
     let phone = '';
+    let resolvedAlt = cleanAlt;
+
     if (cleanRaw.endsWith('@s.whatsapp.net')) {
       const digits = extractDigits(cleanRaw);
       if (digits.length >= 8) {
@@ -668,6 +737,13 @@ class BaileysManager {
       if (altDigits.length >= 8) {
         phone = storage.normalizePhone(altDigits);
       }
+    } else if (cleanRaw.endsWith('@lid')) {
+      const lidDigits = extractDigits(cleanRaw);
+      const mapped = this.lidToPhone.get(lidDigits);
+      if (mapped) {
+        phone = mapped;
+        if (!resolvedAlt) resolvedAlt = `${mapped}@s.whatsapp.net`;
+      }
     }
 
     if (!phone) {
@@ -676,17 +752,40 @@ class BaileysManager {
       phone = cleanRaw.endsWith('@lid') ? rawDigits : storage.normalizePhone(rawDigits);
     }
 
-    return { rawJid: cleanRaw, altJid: cleanAlt, phone };
+    return { rawJid: cleanRaw, altJid: resolvedAlt, phone };
   }
 
   private importContactsBatch(
-    contacts: Array<{ id?: string; lid?: string; name?: string | null; notify?: string | null; verifiedName?: string | null }>
+    contacts: Array<{
+      id?: string;
+      lid?: string;
+      phoneNumber?: string;
+      name?: string | null;
+      notify?: string | null;
+      verifiedName?: string | null;
+    }>
   ): void {
     const mapped: Array<{ phone: string; rawJid?: string; altJid?: string; name?: string }> = [];
     for (const c of contacts) {
-      const addressed = this.resolveJidToPhone(c.id, c.lid);
+      const pnCandidate = c.phoneNumber
+        ? c.phoneNumber.includes('@')
+          ? c.phoneNumber
+          : `${c.phoneNumber.replace(/[^0-9]/g, '')}@s.whatsapp.net`
+        : undefined;
+      if (c.lid && pnCandidate) {
+        this.rememberLidPair(c.lid, pnCandidate);
+      }
+      if (c.id && c.lid) {
+        this.rememberLidPair(c.id, c.lid);
+      }
+      if (c.id && pnCandidate) {
+        this.rememberLidPair(c.id, pnCandidate);
+      }
+
+      const addressed = this.resolveJidToPhone(c.id || pnCandidate, pnCandidate || c.lid);
       if (!addressed) continue;
-      const bestName = (c.name || c.notify || c.verifiedName || '').trim();
+      // Prefer saved phonebook name -> verified business name -> WhatsApp push name
+      const bestName = (c.name || c.verifiedName || c.notify || '').trim();
       if (bestName) {
         this.contactNames.set(addressed.phone, bestName);
         mapped.push({
@@ -698,12 +797,17 @@ class BaileysManager {
       }
     }
     if (mapped.length > 0) {
-      storage.importWhatsAppHistory({ contacts: mapped });
+      const summary = storage.importWhatsAppHistory({ contacts: mapped });
+      if (summary.chatsImported > 0) {
+        this.historySyncListener?.(summary);
+      }
     }
   }
 
   private mapChatRecord(chat: {
     id?: string | null;
+    lidJid?: string | null;
+    pnJid?: string | null;
     name?: string | null;
     conversationTimestamp?: unknown;
     unreadCount?: number | null;
@@ -715,8 +819,13 @@ class BaileysManager {
     lastMessageAt?: string;
     unreadCount?: number;
   } | null {
-    const addressed = this.resolveJidToPhone(chat.id);
+    if (chat.id && chat.pnJid) this.rememberLidPair(chat.id, chat.pnJid);
+    if (chat.lidJid && chat.pnJid) this.rememberLidPair(chat.lidJid, chat.pnJid);
+    if (chat.lidJid && chat.id) this.rememberLidPair(chat.lidJid, chat.id);
+
+    const addressed = this.resolveJidToPhone(chat.id, chat.pnJid || chat.lidJid);
     if (!addressed) return null;
+
     const bestName = (chat.name || this.contactNames.get(addressed.phone) || '').trim();
     if (bestName) {
       this.contactNames.set(addressed.phone, bestName);
@@ -724,6 +833,16 @@ class BaileysManager {
     const tsSec = chat.conversationTimestamp
       ? this.parseMessageTimestampSec(chat.conversationTimestamp)
       : 0;
+
+    // Skip empty anonymous @lid ghost chats that have no real phone, no name, and no timestamp
+    const isUnresolvedLid =
+      addressed.rawJid.endsWith('@lid') &&
+      !addressed.altJid?.endsWith('@s.whatsapp.net') &&
+      addressed.phone.length >= 14;
+    if (isUnresolvedLid && !bestName && tsSec === 0) {
+      return null;
+    }
+
     return {
       phone: addressed.phone,
       rawJid: addressed.rawJid,
@@ -737,6 +856,8 @@ class BaileysManager {
   private importChatsBatch(
     chats: Array<{
       id?: string | null;
+      lidJid?: string | null;
+      pnJid?: string | null;
       name?: string | null;
       conversationTimestamp?: unknown;
       unreadCount?: number | null;
@@ -750,6 +871,132 @@ class BaileysManager {
       if (summary.chatsImported > 0) {
         this.historySyncListener?.(summary);
       }
+    }
+  }
+
+  /**
+   * Fetches & caches a contact's real WhatsApp profile picture (DP) for display in the CRM Live Inbox.
+   */
+  public async fetchProfilePicture(
+    rawPhone: string
+  ): Promise<{ buffer: Buffer; mimeType: string } | null> {
+    const phone = storage.normalizePhone(rawPhone);
+    if (!phone) return null;
+
+    const now = Date.now();
+    const cached = this.avatarCache.get(phone);
+    if (cached) {
+      const ttl = cached.buffer ? 60 * 60 * 1000 : 15 * 60 * 1000;
+      if (now - cached.fetchedAt < ttl) {
+        return cached.buffer ? { buffer: cached.buffer, mimeType: cached.mimeType } : null;
+      }
+    }
+
+    const diskPath = path.join(MEDIA_DIR, `avatar-${phone}.jpg`);
+    if (fs.existsSync(diskPath)) {
+      try {
+        const stat = fs.statSync(diskPath);
+        if (now - stat.mtimeMs < 24 * 60 * 60 * 1000 && stat.size > 0) {
+          const buf = fs.readFileSync(diskPath);
+          this.rememberAvatarCache(phone, buf, 'image/jpeg');
+          return { buffer: buf, mimeType: 'image/jpeg' };
+        }
+      } catch {
+        // continue to live fetch
+      }
+    }
+
+    if (!this.sock || this.status !== 'CONNECTED') {
+      return null;
+    }
+
+    const existingPromise = this.avatarInFlight.get(phone);
+    if (existingPromise) return existingPromise;
+
+    const task = (async (): Promise<{ buffer: Buffer; mimeType: string } | null> => {
+      try {
+        const session = storage.getStore().sessions[phone];
+        const candidateJids = Array.from(
+          new Set(
+            [
+              session?.altJid?.endsWith('@s.whatsapp.net') ? session.altJid : '',
+              session?.rawJid?.includes('@') ? session.rawJid : '',
+              phone.length <= 13 ? `${phone}@s.whatsapp.net` : `${phone}@lid`,
+            ].filter(Boolean)
+          )
+        );
+
+        let picUrl: string | undefined;
+        for (const jid of candidateJids) {
+          if (!this.sock) break;
+          try {
+            picUrl = await Promise.race<string | undefined>([
+              this.sock.profilePictureUrl(jid, 'preview').catch(() =>
+                this.sock ? this.sock.profilePictureUrl(jid, 'image') : undefined
+              ),
+              new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 4000)),
+            ]);
+            if (picUrl) break;
+          } catch {
+            // privacy restricted or not found on this JID
+          }
+        }
+
+        if (!picUrl) {
+          this.rememberAvatarCache(phone, null, 'image/jpeg');
+          return null;
+        }
+
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 4500);
+        const resp = await fetch(picUrl, {
+          signal: controller.signal,
+          headers: { 'User-Agent': 'BGB-WhatsApp-CRM/1.0' },
+        });
+        clearTimeout(timer);
+
+        if (!resp.ok) {
+          this.rememberAvatarCache(phone, null, 'image/jpeg');
+          return null;
+        }
+
+        const arr = await resp.arrayBuffer();
+        if (arr.byteLength === 0 || arr.byteLength > 2 * 1024 * 1024) {
+          this.rememberAvatarCache(phone, null, 'image/jpeg');
+          return null;
+        }
+
+        const buffer = Buffer.from(arr);
+        const mimeType = (resp.headers.get('content-type') || 'image/jpeg').split(';')[0].trim();
+        this.rememberAvatarCache(phone, buffer, mimeType);
+
+        try {
+          if (!fs.existsSync(MEDIA_DIR)) {
+            fs.mkdirSync(MEDIA_DIR, { recursive: true });
+          }
+          fs.writeFileSync(diskPath, buffer);
+        } catch {
+          // ignore disk cache write errors
+        }
+
+        return { buffer, mimeType };
+      } catch {
+        this.rememberAvatarCache(phone, null, 'image/jpeg');
+        return null;
+      } finally {
+        this.avatarInFlight.delete(phone);
+      }
+    })();
+
+    this.avatarInFlight.set(phone, task);
+    return task;
+  }
+
+  private rememberAvatarCache(phone: string, buffer: Buffer | null, mimeType: string): void {
+    this.avatarCache.set(phone, { buffer, mimeType, fetchedAt: Date.now() });
+    if (this.avatarCache.size > 120) {
+      const oldestKey = this.avatarCache.keys().next().value;
+      if (oldestKey) this.avatarCache.delete(oldestKey);
     }
   }
 

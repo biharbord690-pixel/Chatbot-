@@ -200,7 +200,6 @@ export default function AutomationView({
                 className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900"
               >
                 <option value="gemini-4-hydrogen">gemini-4-hydrogen (Recommended · Fast)</option>
-                <option value="gemini-3.8-flash">gemini-3.8-flash (Fast Flash)</option>
                 <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite (Ultra-Fast Lite)</option>
               </select>
             </div>

@@ -374,10 +374,42 @@ export function createApiRouter(): express.Router {
   // LIVE INBOX & CHATS
   // =========================================================================
   router.get('/chats', (_req, res) => {
-    const sessions = Object.values(storage.getStore().sessions).sort(
-      (a, b) => new Date(b.lastMessageAt).getTime() - new Date(a.lastMessageAt).getTime()
-    );
+    const store = storage.getStore();
+    const phonesWithMessages = new Set(store.messages.map((m) => m.phone));
+
+    const sessions = Object.values(store.sessions)
+      .filter((s) => {
+        // Hide empty anonymous @lid ghost sessions (14+ digit internal IDs with no name and no messages)
+        const isUnresolvedLid =
+          s.phone.length >= 14 &&
+          (!s.altJid || !s.altJid.endsWith('@s.whatsapp.net'));
+        const hasRealName = Boolean(s.name && !s.name.startsWith('+') && s.name !== s.phone);
+        const hasHistory = Boolean(s.lastMessage?.trim()) || phonesWithMessages.has(s.phone);
+        if (isUnresolvedLid && !hasRealName && !hasHistory) {
+          return false;
+        }
+        return true;
+      })
+      .sort((a, b) => new Date(b.lastMessageAt).getTime() - new Date(a.lastMessageAt).getTime());
+
     res.json({ sessions });
+  });
+
+  // Live WhatsApp Contact Profile Picture (DP) endpoint with memory + disk caching
+  router.get('/chats/:phone/avatar', async (req, res) => {
+    const phone = storage.normalizePhone(String(req.params.phone || ''));
+    if (!phone) {
+      res.status(404).end();
+      return;
+    }
+    const result = await baileysManager.fetchProfilePicture(phone);
+    if (!result) {
+      res.status(404).end();
+      return;
+    }
+    res.setHeader('Content-Type', result.mimeType || 'image/jpeg');
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.send(result.buffer);
   });
 
   router.get('/chats/:phone/messages', (req, res) => {

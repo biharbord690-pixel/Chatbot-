@@ -433,13 +433,14 @@ class StorageManager {
         diskMutated = true;
       }
 
-      // Automatically upgrade retired/deprecated Gemini 1.5/2.0/2.5 models to active gemini-4-hydrogen
+      // Automatically upgrade retired/deprecated or invalid Gemini models to active gemini-4-hydrogen
       const savedModel = (merged.settings.ai.model || '').trim().toLowerCase();
       if (
         !savedModel ||
         savedModel.startsWith('gemini-1.') ||
         savedModel.startsWith('gemini-2.') ||
-        savedModel === 'gemini-pro'
+        savedModel === 'gemini-pro' ||
+        savedModel === 'gemini-3.8-flash'
       ) {
         merged.settings.ai.model = 'gemini-4-hydrogen';
         this.lastLoadMigratedAdmin = true;
@@ -595,6 +596,73 @@ class StorageManager {
     this.data.sessions[phone] = updated;
     this.persist();
     return updated;
+  }
+
+  /**
+   * Merges a duplicate @lid session (e.g. 247450782707875) into its resolved real phone session
+   * (e.g. 918603259022), preserving all messages, JIDs, and contact name cleanly.
+   */
+  public mergeLidSessionIntoPhone(rawLidDigits: string, rawRealPhone: string): boolean {
+    const lidKey = rawLidDigits.replace(/[^0-9]/g, '');
+    const realPhone = this.normalizePhone(rawRealPhone);
+    if (!lidKey || !realPhone || lidKey === realPhone) return false;
+
+    const lidSession = this.data.sessions[lidKey];
+    if (!lidSession) return false;
+
+    const existingReal = this.data.sessions[realPhone];
+    if (!existingReal) {
+      this.data.sessions[realPhone] = {
+        ...lidSession,
+        phone: realPhone,
+        name:
+          lidSession.name && !lidSession.name.startsWith('+') && lidSession.name !== lidKey
+            ? lidSession.name
+            : `+${realPhone}`,
+        rawJid: lidSession.rawJid || `${lidKey}@lid`,
+        altJid: `${realPhone}@s.whatsapp.net`,
+      };
+    } else {
+      const lidHasBetterName =
+        lidSession.name &&
+        !lidSession.name.startsWith('+') &&
+        lidSession.name !== lidKey &&
+        (existingReal.name.startsWith('+') || existingReal.name === realPhone);
+      if (lidHasBetterName) {
+        existingReal.name = lidSession.name;
+      }
+      if (!existingReal.rawJid && lidSession.rawJid) existingReal.rawJid = lidSession.rawJid;
+      if (!existingReal.altJid) existingReal.altJid = `${realPhone}@s.whatsapp.net`;
+      if (!existingReal.avatarUrl && lidSession.avatarUrl) {
+        existingReal.avatarUrl = lidSession.avatarUrl;
+      }
+      existingReal.unreadCount = Math.max(existingReal.unreadCount, lidSession.unreadCount);
+      if (
+        lidSession.lastMessage &&
+        new Date(lidSession.lastMessageAt).getTime() > new Date(existingReal.lastMessageAt).getTime()
+      ) {
+        existingReal.lastMessage = lidSession.lastMessage;
+        existingReal.lastMessageDirection = lidSession.lastMessageDirection;
+        existingReal.lastMessageAt = lidSession.lastMessageAt;
+      }
+    }
+
+    let movedMessages = false;
+    for (const msg of this.data.messages) {
+      if (msg.phone === lidKey) {
+        msg.phone = realPhone;
+        movedMessages = true;
+      }
+    }
+    if (movedMessages) {
+      this.data.messages.sort(
+        (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+      );
+    }
+
+    delete this.data.sessions[lidKey];
+    this.persist();
+    return true;
   }
 
   public hasMessageWithWamId(wamId: string): boolean {
@@ -819,18 +887,32 @@ class StorageManager {
     const nowIso = new Date().toISOString();
 
     if (params.contacts && params.contacts.length > 0) {
+      let contactUpdated = false;
       for (const c of params.contacts) {
         const phone = this.normalizePhone(c.phone);
         if (!phone) continue;
         const existing = this.data.sessions[phone];
         const cleanName = (c.name || '').trim();
         if (existing) {
-          if (cleanName && (existing.name.startsWith('+') || existing.name === phone)) {
-            existing.name = cleanName;
+          if (cleanName && existing.name !== cleanName) {
+            // Prefer saved phonebook/verified name over phone number or generic push name
+            if (existing.name.startsWith('+') || existing.name === phone || cleanName.length >= 2) {
+              existing.name = cleanName;
+              contactUpdated = true;
+            }
           }
-          if (c.rawJid && !existing.rawJid) existing.rawJid = c.rawJid;
-          if (c.altJid && !existing.altJid) existing.altJid = c.altJid;
+          if (c.rawJid && !existing.rawJid) {
+            existing.rawJid = c.rawJid;
+            contactUpdated = true;
+          }
+          if (c.altJid && !existing.altJid) {
+            existing.altJid = c.altJid;
+            contactUpdated = true;
+          }
         }
+      }
+      if (contactUpdated) {
+        chatsImported += 1;
       }
     }
 

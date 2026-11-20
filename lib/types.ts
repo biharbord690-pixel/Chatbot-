@@ -114,6 +114,7 @@ export interface ChatSession {
   rawJid?: string;
   altJid?: string;
   name: string;
+  avatarUrl?: string;
   state: CustomerState;
   channel: ChannelType;
   aiEnabled: boolean;

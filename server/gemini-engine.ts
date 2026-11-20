@@ -23,6 +23,30 @@ let cachedConfiguredModel = '';
 let cachedUseOptionalParams = true;
 let cachedWorkingModelAt = 0;
 const MODEL_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const unavailableModels = new Map<string, number>();
+
+function isModelMarkedUnavailable(model: string): boolean {
+  const markedAt = unavailableModels.get(model);
+  if (!markedAt) return false;
+  if (Date.now() - markedAt > MODEL_CACHE_TTL_MS) {
+    unavailableModels.delete(model);
+    return false;
+  }
+  return true;
+}
+
+function isSimpleGreetingOnly(text: string): boolean {
+  const cleaned = text
+    .trim()
+    .toLowerCase()
+    .replace(/[!?.,।~🙏😊👋😀😃😄😁🙂❤️]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned || cleaned.length > 28) return false;
+  return /^(hi+|hey+|helo+|hello+|hlo+|namaste|namaskar|pranam|parnam|ram ram|radhe radhe|jay shri ram|jai shri ram|salam|good morning|good afternoon|good evening|good night|gm|gn|ok+|okay|thk|thik hai|theek hai|thanks|thank you|dhanyawad|shukriya|bye+|tata|ji|haan|han|hm+|hmm+|नमस्ते|नमस्कार|प्रणाम|हेलो|हाय|ठीक है|धन्यवाद|शुक्रिया)$/.test(
+    cleaned
+  );
+}
 
 function getGeminiClient(): GoogleGenAI {
   const apiKey = resolveServerGeminiApiKey();
@@ -359,15 +383,19 @@ export async function generateAiReply(params: {
     }
   }
 
+  const effectiveHistoryLimit = Math.min(aiSettings.maxHistoryTurns, 6) * 2;
   const recentMessages = storage
-    .getMessagesByPhone(phone, aiSettings.maxHistoryTurns * 2)
-    .slice(-aiSettings.maxHistoryTurns * 2);
+    .getMessagesByPhone(phone, effectiveHistoryLimit)
+    .slice(-effectiveHistoryLimit);
 
   // Build strictly alternating user/model turns (Gemini rejects consecutive user turns or model-first history)
+  // Keep older turns concise so token count stays low and replies stay ultra-fast even on free tier!
   const contents: Content[] = [];
-  const pushTurn = (role: 'user' | 'model', text: string) => {
-    const clean = text.trim();
-    if (!clean) return;
+  const pushTurn = (role: 'user' | 'model', text: string, isOlderTurn = false) => {
+    const rawClean = text.trim();
+    if (!rawClean) return;
+    const clean =
+      isOlderTurn && rawClean.length > 420 ? `${rawClean.slice(0, 420)}…` : rawClean;
     const prev = contents[contents.length - 1];
     if (!prev) {
       if (role !== 'user') return;
@@ -382,10 +410,12 @@ export async function generateAiReply(params: {
     }
   };
 
-  for (const m of recentMessages) {
+  const recentCutoffIdx = Math.max(0, recentMessages.length - 4);
+  for (let idx = 0; idx < recentMessages.length; idx += 1) {
+    const m = recentMessages[idx];
     if (m.senderType === 'SYSTEM') continue;
     const role: 'user' | 'model' = m.direction === 'INBOUND' ? 'user' : 'model';
-    pushTurn(role, m.body);
+    pushTurn(role, m.body, idx < recentCutoffIdx);
   }
 
   // Ensure the latest customer message is always at the tail as a user turn
@@ -396,7 +426,7 @@ export async function generateAiReply(params: {
     lastContent.role !== 'user' ||
     !(lastContent.parts?.[0]?.text || '').endsWith(latestText)
   ) {
-    pushTurn('user', latestText);
+    pushTurn('user', latestText, false);
   }
 
   // Attach incoming customer Photos & Voice Messages directly as Gemini multimodal inlineData parts
@@ -442,12 +472,13 @@ export async function generateAiReply(params: {
 
   const ai = getGeminiClient();
   const rawConfiguredModel = (aiSettings.model || '').trim();
-  const isRetiredModel =
+  const isRetiredOrInvalidModel =
     !rawConfiguredModel ||
     rawConfiguredModel.startsWith('gemini-1.') ||
     rawConfiguredModel.startsWith('gemini-2.') ||
-    rawConfiguredModel === 'gemini-pro';
-  const modelName = isRetiredModel ? 'gemini-4-hydrogen' : rawConfiguredModel;
+    rawConfiguredModel === 'gemini-pro' ||
+    rawConfiguredModel === 'gemini-3.8-flash';
+  const modelName = isRetiredOrInvalidModel ? 'gemini-4-hydrogen' : rawConfiguredModel;
 
   const recentOrderWarning = session.context.lastOrderId
     ? `\n- ⚠️ महत्वपूर्ण चेतावनी: इस ग्राहक का ऑर्डर *${session.context.lastOrderId}*${session.context.lastOrderProductName ? ` (${session.context.lastOrderProductName})` : ''} पहले से दर्ज हो चुका है। दोबारा place_order टूल *कभी न चलाएँ* (कूपन लगाने, पता बदलने, या "ok/thanks/confirm" बोलने पर भी नहीं) — जब तक ग्राहक साफ-साफ "एक और नया ऑर्डर करना है" न बोले।`
@@ -461,20 +492,34 @@ export async function generateAiReply(params: {
   let nextState: CustomerState = session.state;
   let matchedProductCard: GeminiReplyResult['matchedProductCard'];
 
-  const buildConfig = (targetModel: string, includeOptionalParams: boolean) => {
+  // Skip attaching heavy tool JSON schemas on pure 1–2 word greetings ("Hello", "Namaste", "Thanks")
+  // so Gemini responds in ~1s while still giving a genuine, personalized AI reply!
+  const skipToolsForGreeting =
+    !hasMedia && session.state !== 'ORDER_PLACING' && isSimpleGreetingOnly(params.messageText);
+
+  const buildConfig = (
+    targetModel: string,
+    includeOptionalParams: boolean,
+    abortSignal?: AbortSignal
+  ) => {
     const isGemini4 = targetModel.startsWith('gemini-4');
     const isFlashLite = targetModel.includes('flash-lite');
     const baseConfig: Record<string, unknown> = {
       systemInstruction,
-      tools: [
-        {
-          functionDeclarations: [
-            searchProductsDeclaration,
-            placeOrderDeclaration,
-            checkOrderStatusDeclaration,
-          ],
-        },
-      ],
+      ...(abortSignal ? { abortSignal } : {}),
+      ...(skipToolsForGreeting
+        ? {}
+        : {
+            tools: [
+              {
+                functionDeclarations: [
+                  searchProductsDeclaration,
+                  placeOrderDeclaration,
+                  checkOrderStatusDeclaration,
+                ],
+              },
+            ],
+          }),
     };
 
     if (includeOptionalParams) {
@@ -483,10 +528,11 @@ export async function generateAiReply(params: {
         baseConfig.temperature = aiSettings.temperature;
       }
 
-      // Use LOW / MINIMAL ThinkingLevel on Gemini 3 & 4 models for ultra-fast WhatsApp chat replies
-      if (isGemini4 || targetModel.startsWith('gemini-3')) {
+      // Gemini 4 defaults to HIGH thinking; use LOW for fast WhatsApp replies.
+      // gemini-3.1-flash-lite already defaults to MINIMAL thinking natively — no extra thinkingConfig needed.
+      if (isGemini4 && !isFlashLite) {
         baseConfig.thinkingConfig = {
-          thinkingLevel: isFlashLite ? ThinkingLevel.MINIMAL : ThinkingLevel.LOW,
+          thinkingLevel: ThinkingLevel.LOW,
         };
       }
     }
@@ -494,39 +540,66 @@ export async function generateAiReply(params: {
     return baseConfig;
   };
 
-  // Ordered active free-tier fallback list (never uses deprecated 1.5/2.0/2.5 models)
-  // Put the last known fast working model first so every subsequent customer gets instant attempt #1 replies!
+  // Ordered active free-tier fallback list (never uses deprecated 1.5/2.0/pro or invalid model IDs)
+  // Put the last known fast working model first and skip any model known to return 404 on this API key!
   const isCacheValid =
     Boolean(cachedWorkingModel) &&
     cachedConfiguredModel === modelName &&
-    Date.now() - cachedWorkingModelAt < MODEL_CACHE_TTL_MS;
+    Date.now() - cachedWorkingModelAt < MODEL_CACHE_TTL_MS &&
+    !isModelMarkedUnavailable(cachedWorkingModel);
 
-  const candidateModels = Array.from(
+  const allCandidates = Array.from(
     new Set([
       ...(isCacheValid ? [cachedWorkingModel] : []),
       modelName,
       'gemini-4-hydrogen',
-      'gemini-3.8-flash',
       'gemini-3.1-flash-lite',
     ])
   );
+  const filteredCandidates = allCandidates.filter((m) => !isModelMarkedUnavailable(m));
+  const candidateModels = filteredCandidates.length > 0 ? filteredCandidates : allCandidates;
+
   let activeModel = candidateModels[0];
   let useOptionalParams = isCacheValid ? cachedUseOptionalParams : true;
 
+  const invokeWithAbortTimeout = async (
+    candidate: string,
+    turnContents: Content[],
+    optParams: boolean,
+    timeoutMs: number,
+    label: string
+  ) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await withTimeout(
+        ai.models.generateContent({
+          model: candidate,
+          contents: turnContents,
+          config: buildConfig(candidate, optParams, controller.signal),
+        }),
+        timeoutMs + 1000,
+        label
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
   const callModelSafely = async (turnContents: Content[]) => {
     let lastError: unknown;
+    const attemptSummaries: string[] = [];
     const startIdx = Math.max(0, candidateModels.indexOf(activeModel));
+    const baseTimeoutMs = hasMedia ? 30_000 : 24_000;
 
     for (let i = startIdx; i < candidateModels.length; i += 1) {
       const candidate = candidateModels[i];
       try {
-        const res = await withTimeout(
-          ai.models.generateContent({
-            model: candidate,
-            contents: turnContents,
-            config: buildConfig(candidate, useOptionalParams),
-          }),
-          12_000,
+        const res = await invokeWithAbortTimeout(
+          candidate,
+          turnContents,
+          useOptionalParams,
+          baseTimeoutMs,
           `gemini:${candidate}`
         );
         activeModel = candidate;
@@ -537,7 +610,25 @@ export async function generateAiReply(params: {
         return res;
       } catch (err) {
         lastError = err;
-        const msg = formatFullError(err).toLowerCase();
+        const rawErrMsg = formatFullError(err);
+        const msg = rawErrMsg.toLowerCase();
+        attemptSummaries.push(`${candidate}: ${rawErrMsg.slice(0, 120)}`);
+
+        // Cache 404/NOT_FOUND models as unavailable for 30 min so future messages skip them in 0ms
+        if (msg.includes('404') || msg.includes('not_found') || msg.includes('is not found')) {
+          unavailableModels.set(candidate, Date.now());
+          if (candidate === cachedWorkingModel) cachedWorkingModel = '';
+          continue;
+        }
+
+        // If API key is invalid/unauthorized, fail immediately rather than trying other models
+        if (
+          msg.includes('api_key_invalid') ||
+          msg.includes('permission_denied') ||
+          msg.includes('403')
+        ) {
+          throw lastError;
+        }
 
         // If thinkingConfig or temperature was rejected by this model, retry cleanly with minimal config
         if (
@@ -548,13 +639,11 @@ export async function generateAiReply(params: {
             msg.includes('400'))
         ) {
           try {
-            const retryRes = await withTimeout(
-              ai.models.generateContent({
-                model: candidate,
-                contents: turnContents,
-                config: buildConfig(candidate, false),
-              }),
-              12_000,
+            const retryRes = await invokeWithAbortTimeout(
+              candidate,
+              turnContents,
+              false,
+              baseTimeoutMs,
               `gemini:${candidate}:minimal`
             );
             activeModel = candidate;
@@ -566,28 +655,64 @@ export async function generateAiReply(params: {
             return retryRes;
           } catch (retryErr) {
             lastError = retryErr;
+            attemptSummaries.push(`${candidate}(minimal): ${formatFullError(retryErr).slice(0, 100)}`);
           }
         }
 
-        // Invalidate cached model if the cached candidate failed
+        // Transient timeout / 503 / 429 / network stall: retry ONCE cleanly after a short 700ms backoff
+        // using trimmed recent context so free-tier spikes recover automatically without failing the user!
+        const isTransient =
+          msg.includes('timed out') ||
+          msg.includes('abort') ||
+          msg.includes('503') ||
+          msg.includes('unavailable') ||
+          msg.includes('overloaded') ||
+          msg.includes('429') ||
+          msg.includes('resource_exhausted') ||
+          msg.includes('fetch failed') ||
+          msg.includes('econnreset') ||
+          msg.includes('etimedout');
+
+        if (isTransient) {
+          await new Promise((r) => setTimeout(r, 700));
+          // Keep last 4 turns on retry (ensuring first turn is 'user') to guarantee fast response
+          let compactContents = turnContents;
+          if (turnContents.length > 4) {
+            const sliced = turnContents.slice(-4);
+            const firstUserIdx = sliced.findIndex((c) => c.role === 'user');
+            if (firstUserIdx >= 0) {
+              compactContents = sliced.slice(firstUserIdx);
+            }
+          }
+          try {
+            const retryRes = await invokeWithAbortTimeout(
+              candidate,
+              compactContents,
+              false,
+              28_000,
+              `gemini:${candidate}:retry`
+            );
+            activeModel = candidate;
+            cachedWorkingModel = candidate;
+            cachedConfiguredModel = modelName;
+            cachedUseOptionalParams = false;
+            cachedWorkingModelAt = Date.now();
+            return retryRes;
+          } catch (retryErr) {
+            lastError = retryErr;
+            attemptSummaries.push(`${candidate}(retry): ${formatFullError(retryErr).slice(0, 100)}`);
+          }
+        }
+
         if (candidate === cachedWorkingModel) {
           cachedWorkingModel = '';
         }
-
-        // If API key is invalid/unauthorized, fail immediately rather than trying other models
-        const retryMsg = formatFullError(lastError).toLowerCase();
-        if (
-          retryMsg.includes('api_key_invalid') ||
-          retryMsg.includes('permission_denied') ||
-          retryMsg.includes('403')
-        ) {
-          throw lastError;
-        }
-        // Otherwise (404 NOT_FOUND / 503 overloaded / 429 / timeout), fall through to next active model
       }
     }
 
-    throw lastError;
+    throw new Error(
+      attemptSummaries.length > 0 ? attemptSummaries.join(' | ') : formatFullError(lastError)
+    );
   };
 
   try {
@@ -610,7 +735,7 @@ export async function generateAiReply(params: {
               ],
             },
           }),
-          12_000,
+          24_000,
           'gemini:transcribe'
         );
         const transcript = (transcriptRes.text || '').trim();
