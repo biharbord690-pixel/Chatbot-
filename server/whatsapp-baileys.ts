@@ -616,6 +616,20 @@ class BaileysManager {
     }
   }
 
+  public async sendTypingIndicator(
+    targetJid: string | undefined,
+    composing: boolean
+  ): Promise<void> {
+    if (!this.sock || this.status !== 'CONNECTED' || !targetJid || !targetJid.includes('@')) {
+      return;
+    }
+    try {
+      await this.sock.sendPresenceUpdate(composing ? 'composing' : 'paused', targetJid);
+    } catch {
+      // presence updates are best-effort only
+    }
+  }
+
   public async sendMessage(params: {
     phone: string;
     targetJid?: string;

@@ -141,6 +141,22 @@ export function getAuthorizedAdminEmail(): string {
   return DEFAULT_ADMIN_EMAIL;
 }
 
+export function resolveServerGeminiApiKey(): string {
+  const candidates = [
+    process.env.GEMINI_API_KEY,
+    process.env.GOOGLE_API_KEY,
+    process.env.GOOGLE_GEMINI_API_KEY,
+  ];
+  for (const raw of candidates) {
+    const unquoted = (raw || '').trim().replace(/^["']+|["']+$/g, '').trim();
+    const cleaned = cleanOptionalEnv(unquoted);
+    if (cleaned && cleaned.length > 10) {
+      return cleaned;
+    }
+  }
+  return '';
+}
+
 function getEncryptionKey(): Buffer {
   ensureDataDir();
   const envKey = cleanOptionalEnv(process.env.CONFIG_ENCRYPTION_KEY);
@@ -445,11 +461,7 @@ class StorageManager {
         maskedAppSecret: maskSecret(secrets.metaAppSecret),
         maskedAccessToken: maskSecret(secrets.metaAccessToken),
       },
-      geminiConfigured: Boolean(
-        process.env.GEMINI_API_KEY &&
-          process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY' &&
-          process.env.GEMINI_API_KEY.trim().length > 10
-      ),
+      geminiConfigured: Boolean(resolveServerGeminiApiKey()),
     };
   }
 

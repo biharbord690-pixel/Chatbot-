@@ -266,11 +266,23 @@ class MessageRouter {
     messageText: string;
     preferredChannel: ChannelType;
   }): Promise<void> {
-    const aiResult = await generateAiReply({
-      phone: params.phone,
-      customerName: params.customerName,
-      messageText: params.messageText,
-    });
+    const typingJid = params.rawJid || params.altJid;
+    if (params.preferredChannel === 'baileys' && typingJid) {
+      void baileysManager.sendTypingIndicator(typingJid, true);
+    }
+
+    let aiResult: Awaited<ReturnType<typeof generateAiReply>>;
+    try {
+      aiResult = await generateAiReply({
+        phone: params.phone,
+        customerName: params.customerName,
+        messageText: params.messageText,
+      });
+    } finally {
+      if (params.preferredChannel === 'baileys' && typingJid) {
+        void baileysManager.sendTypingIndicator(typingJid, false);
+      }
+    }
 
     if (aiResult.skipped || !aiResult.reply) {
       if (aiResult.skipReason) {

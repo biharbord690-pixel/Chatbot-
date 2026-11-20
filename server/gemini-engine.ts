@@ -12,16 +12,23 @@ import {
   placeLiveOrder,
   searchLiveProducts,
 } from './ecommerce';
-import { storage } from './storage';
+import { resolveServerGeminiApiKey, storage } from './storage';
+
+let cachedGeminiClient: GoogleGenAI | null = null;
+let cachedGeminiKey = '';
 
 function getGeminiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
+  const apiKey = resolveServerGeminiApiKey();
+  if (!apiKey) {
     throw new Error(
       'GEMINI_API_KEY is not configured in server environment secrets.'
     );
   }
-  return new GoogleGenAI({
+  if (cachedGeminiClient && cachedGeminiKey === apiKey) {
+    return cachedGeminiClient;
+  }
+  cachedGeminiKey = apiKey;
+  cachedGeminiClient = new GoogleGenAI({
     apiKey,
     // Function calling (tools / functionDeclarations) requires v1beta on @google/genai v2+
     apiVersion: 'v1beta',
@@ -31,6 +38,7 @@ function getGeminiClient(): GoogleGenAI {
       },
     },
   });
+  return cachedGeminiClient;
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
@@ -358,6 +366,7 @@ export async function generateAiReply(params: {
   const buildConfig = () => {
     const baseConfig: Record<string, unknown> = {
       systemInstruction,
+      maxOutputTokens: 450,
       tools: [
         {
           functionDeclarations: [
@@ -370,6 +379,10 @@ export async function generateAiReply(params: {
     };
     if (!isGemini4) {
       baseConfig.temperature = aiSettings.temperature;
+    }
+    // Disable hidden thinking tokens on Gemini 2.5 Flash for ultra-fast (<1s) WhatsApp chat replies
+    if (modelName.includes('2.5-flash')) {
+      baseConfig.thinkingConfig = { thinkingBudget: 0 };
     }
     return baseConfig;
   };
