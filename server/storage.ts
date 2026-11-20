@@ -16,7 +16,7 @@ import { scheduleRemoteBackup } from './remote-backup';
 
 export const DATA_DIR = path.join(process.cwd(), 'data');
 export const BAILEYS_AUTH_DIR = path.join(DATA_DIR, 'baileys_auth');
-export const DEFAULT_ADMIN_EMAIL = 'bihargraminbazaar98@gmail.com';
+export const DEFAULT_ADMIN_EMAIL = 'bihargraminbazaar9@gmail.com';
 const STORE_FILE = path.join(DATA_DIR, 'crm_store.json');
 const SECRETS_FILE = path.join(DATA_DIR, 'secrets.enc');
 const KEY_FILE = path.join(DATA_DIR, '.vault.key');
