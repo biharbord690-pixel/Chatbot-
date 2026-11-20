@@ -1,0 +1,6 @@
+{
+  "name": "BGB WhatsApp AI CRM",
+  "description": "Wapio-style WhatsApp AI Chatbot Automation and Live CRM Platform integrated with Bihar Gramin Bazaar.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

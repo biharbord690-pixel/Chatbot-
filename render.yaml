@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: bgb-whatsapp-ai-crm
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm install && npm run build
+    startCommand: npm run start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 22.14.0
+      - key: NODE_ENV
+        value: production
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: APP_URL
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: CONFIG_ENCRYPTION_KEY
+        sync: false
+      - key: BACKUP_SYNC_URL
+        sync: false
+      - key: BACKUP_SYNC_TOKEN
+        sync: false
