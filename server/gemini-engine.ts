@@ -69,16 +69,20 @@ function formatFullError(err: unknown): string {
   }
 }
 
+function sanitizeBrandIdentity(text: string): string {
+  // Never mention Google, Gemini, OpenAI, or ChatGPT in customer-facing WhatsApp replies
+  return text
+    .replace(/\b(google\s*gemini|google\s*ai|google|gemini|openai|chatgpt)\b/gi, 'Bihar Gramin Bazaar')
+    .replace(/गूगल/g, 'बिहार ग्रामीण बाज़ार')
+    .replace(/जेमिनी/g, 'बिहार ग्रामीण बाज़ार');
+}
+
 export function buildHindiFallbackReply(customerName?: string): string {
-  const greeting = customerName && !customerName.startsWith('+') ? `प्रणाम ${customerName} जी!` : 'प्रणाम जी!';
+  const greeting =
+    customerName && !customerName.startsWith('+') ? `Namaste ${customerName} ji!` : 'Namaste ji!';
   return (
-    `${greeting} *बिहार ग्रामीण बाज़ार* में आपका स्वागत है।\n\n` +
-    `हम बिहार के सभी 38 ज़िलों में *कैश ऑन डिलीवरी (COD)* की सुविधा देते हैं:\n` +
-    `• ₹499+ के ऑर्डर पर *फ्री डिलीवरी* (कम पर ₹40)\n` +
-    `• 7 दिन आसान रिप्लेसमेंट गारंटी\n` +
-    `• वेबसाइट: https://bihargraminbazaar.com\n` +
-    `• हेल्पलाइन: +91 9472258022\n\n` +
-    `कृपया बताएं आपको कौन सा उत्पाद चाहिए या ऑर्डर के बारे में क्या जानकारी चाहिए? हमारी टीम तुरंत आपकी मदद करेगी।`
+    `${greeting} *Bihar Gramin Bazaar* me aapka swagat hai 😊\n` +
+    `Abhi thoda network busy chal raha hai — kripya apna sawal ya product ka naam dobara bhejein, ya hamari website https://bihargraminbazaar.com dekhein (Helpline: +91 9472258022).`
   );
 }
 
@@ -326,34 +330,45 @@ export async function generateAiReply(params: {
     .getMessagesByPhone(phone, aiSettings.maxHistoryTurns * 2)
     .slice(-aiSettings.maxHistoryTurns * 2);
 
+  // Build strictly alternating user/model turns (Gemini rejects consecutive user turns or model-first history)
   const contents: Content[] = [];
-  for (const m of recentMessages) {
-    const role = m.direction === 'INBOUND' ? 'user' : 'model';
-    if (m.body.trim()) {
-      contents.push({
-        role,
-        parts: [{ text: m.body }],
-      });
+  const pushTurn = (role: 'user' | 'model', text: string) => {
+    const clean = text.trim();
+    if (!clean) return;
+    const prev = contents[contents.length - 1];
+    if (!prev) {
+      if (role !== 'user') return;
+      contents.push({ role: 'user', parts: [{ text: clean }] });
+      return;
     }
+    if (prev.role === role) {
+      const prevText = prev.parts?.[0]?.text || '';
+      prev.parts = [{ text: `${prevText}\n${clean}` }];
+    } else {
+      contents.push({ role, parts: [{ text: clean }] });
+    }
+  };
+
+  for (const m of recentMessages) {
+    if (m.senderType === 'SYSTEM') continue;
+    const role: 'user' | 'model' = m.direction === 'INBOUND' ? 'user' : 'model';
+    pushTurn(role, m.body);
   }
 
-  // Ensure the latest user message is present at the tail
+  // Ensure the latest customer message is always at the tail as a user turn
+  const latestText = params.messageText.trim();
   const lastContent = contents[contents.length - 1];
   if (
     !lastContent ||
     lastContent.role !== 'user' ||
-    lastContent.parts?.[0]?.text !== params.messageText
+    !(lastContent.parts?.[0]?.text || '').endsWith(latestText)
   ) {
-    contents.push({
-      role: 'user',
-      parts: [{ text: params.messageText }],
-    });
+    pushTurn('user', latestText);
   }
 
   const ai = getGeminiClient();
   const configuredModel = (aiSettings.model || '').trim();
   const modelName = configuredModel || 'gemini-2.5-flash';
-  const isGemini4 = modelName.startsWith('gemini-4');
 
   const sessionContextNote = `\n\n[वर्तमान ग्राहक संदर्भ]:\n- WhatsApp फोन: +${phone}\n- ग्राहक नाम: ${session.name}\n- वर्तमान स्थिति (State): ${session.state}\n- पिछला देखा गया उत्पाद: ${session.context.lastProductName || 'कोई नहीं'} (ID: ${session.context.lastProductId || 'N/A'})\n- पिछला ऑर्डर ID: ${session.context.lastOrderId || 'कोई नहीं'}`;
 
@@ -363,10 +378,11 @@ export async function generateAiReply(params: {
   let nextState: CustomerState = session.state;
   let matchedProductCard: GeminiReplyResult['matchedProductCard'];
 
-  const buildConfig = () => {
+  const buildConfig = (targetModel: string, includeThinkingZero: boolean) => {
+    const isGemini4 = targetModel.startsWith('gemini-4');
     const baseConfig: Record<string, unknown> = {
       systemInstruction,
-      maxOutputTokens: 450,
+      maxOutputTokens: 600,
       tools: [
         {
           functionDeclarations: [
@@ -380,19 +396,53 @@ export async function generateAiReply(params: {
     if (!isGemini4) {
       baseConfig.temperature = aiSettings.temperature;
     }
-    // Disable hidden thinking tokens on Gemini 2.5 Flash for ultra-fast (<1s) WhatsApp chat replies
-    if (modelName.includes('2.5-flash')) {
+    // Disable hidden thinking tokens on Gemini 2.5 Flash for ultra-fast (<1s) WhatsApp replies
+    if (includeThinkingZero && targetModel.includes('2.5-flash')) {
       baseConfig.thinkingConfig = { thinkingBudget: 0 };
     }
     return baseConfig;
   };
 
+  let activeModel = modelName;
+  let useThinkingZero = activeModel.includes('2.5-flash');
+
+  const callModelSafely = async (turnContents: Content[]) => {
+    try {
+      return await ai.models.generateContent({
+        model: activeModel,
+        contents: turnContents,
+        config: buildConfig(activeModel, useThinkingZero),
+      });
+    } catch (firstErr) {
+      const msg = formatFullError(firstErr).toLowerCase();
+      // Retry 1: If thinkingConfig caused a 400 INVALID_ARGUMENT, retry cleanly without it
+      if (useThinkingZero && (msg.includes('thinking') || msg.includes('invalid_argument') || msg.includes('400'))) {
+        useThinkingZero = false;
+        return await ai.models.generateContent({
+          model: activeModel,
+          contents: turnContents,
+          config: buildConfig(activeModel, false),
+        });
+      }
+      // Retry 2: If configured model is unavailable/deprecated/overloaded, fall back to gemini-2.0-flash
+      if (
+        activeModel !== 'gemini-2.0-flash' &&
+        (msg.includes('404') || msg.includes('not found') || msg.includes('503') || msg.includes('overloaded'))
+      ) {
+        activeModel = 'gemini-2.0-flash';
+        useThinkingZero = false;
+        return await ai.models.generateContent({
+          model: activeModel,
+          contents: turnContents,
+          config: buildConfig(activeModel, false),
+        });
+      }
+      throw firstErr;
+    }
+  };
+
   try {
-    let response = await ai.models.generateContent({
-      model: modelName,
-      contents,
-      config: buildConfig(),
-    });
+    let response = await callModelSafely(contents);
 
     // Multi-turn tool execution loop (up to 4 tool steps)
     let loops = 0;
@@ -606,16 +656,13 @@ export async function generateAiReply(params: {
         parts: responseParts,
       });
 
-      response = await ai.models.generateContent({
-        model: modelName,
-        contents,
-        config: buildConfig(),
-      });
+      response = await callModelSafely(contents);
     }
 
-    const finalText =
+    const rawFinalText =
       (response.text || '').trim() ||
-      'प्रणाम जी! कृपया अपना प्रश्न थोड़ा विस्तार से लिखें, या कस्टमर केयर +91 9472258022 पर संपर्क करें।';
+      'Namaste ji! Kripya apna sawal thoda detail me batayein, ya helpline +91 9472258022 par sampark karein.';
+    const finalText = sanitizeBrandIdentity(rawFinalText);
 
     // Detect if customer is actively ordering even before calling place_order
     if (
@@ -631,7 +678,7 @@ export async function generateAiReply(params: {
       phone,
       query: params.messageText.slice(0, 300),
       reply: finalText.slice(0, 500),
-      model: modelName,
+      model: activeModel,
       toolsUsed: toolCallsLog.map((t) => t.name),
       latencyMs: Date.now() - startedAt,
       status: 'SUCCESS',
