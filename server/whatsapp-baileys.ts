@@ -5,7 +5,7 @@ import type { WAMessage, WASocket, proto } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import QRCode from 'qrcode';
 import type { BaileysConnectionStatus, BaileysStateSnapshot } from '../lib/types';
-import { scheduleRemoteBackup } from './remote-backup';
+import { flushRemoteBackupNow, scheduleRemoteBackup } from './remote-backup';
 import { BAILEYS_AUTH_DIR, storage } from './storage';
 
 type BaileysModule = typeof import('@whiskeysockets/baileys');
@@ -61,6 +61,7 @@ class BaileysManager {
   private isConnecting = false;
   private intentionalDisconnect = false;
   private pairingModeActive = false;
+  private cachedVersion: [number, number, number] | undefined;
 
   private statusListeners: Set<StatusListener> = new Set();
   private logListeners: Set<LogListener> = new Set();
@@ -227,21 +228,28 @@ class BaileysManager {
         scheduleRemoteBackup('baileys_auth');
       };
 
-      let version: [number, number, number] | undefined;
-      try {
-        const latest = await fetchLatestBaileysVersion();
-        version = latest.version;
-      } catch {
-        // fallback to bundled WhatsApp Web version
+      let version = this.cachedVersion;
+      if (!version) {
+        try {
+          const latest = await fetchLatestBaileysVersion();
+          version = latest.version;
+          this.cachedVersion = version;
+        } catch {
+          // fallback to bundled WhatsApp Web version
+        }
       }
 
       const sock = makeWASocket({
         auth: state,
         version,
         logger: pino({ level: 'silent' }),
-        browser: Browsers.ubuntu('Chrome'),
+        browser: Browsers.macOS('Chrome'),
         markOnlineOnConnect: true,
         syncFullHistory: false,
+        shouldSyncHistoryMessage: () => false,
+        connectTimeoutMs: 60_000,
+        defaultQueryTimeoutMs: 60_000,
+        keepAliveIntervalMs: 25_000,
       });
 
       this.sock = sock;
@@ -268,7 +276,9 @@ class BaileysManager {
             this.status = 'QR_READY';
             this.lastError = null;
             this.emitStatus();
-            this.log('info', 'Live QR code ready. Scan from WhatsApp -> Linked Devices.');
+            if (!this.pairingModeActive) {
+              this.log('info', 'Live QR code ready. Scan from WhatsApp -> Linked Devices.');
+            }
           } catch (err) {
             this.lastError =
               err instanceof Error ? err.message : 'Failed to render QR code image';
@@ -294,6 +304,8 @@ class BaileysManager {
             'success',
             `Connected to WhatsApp as ${this.connectedName}${this.connectedPhone ? ` (+${this.connectedPhone})` : ''}.`
           );
+          // Immediately back up freshly linked session to remote vault (e.g. MilesWeb)
+          void flushRemoteBackupNow('whatsapp_connected');
         }
 
         if (connection === 'close') {
@@ -301,6 +313,7 @@ class BaileysManager {
           const statusCode = boomErr?.output?.statusCode;
           const errMessage = boomErr?.message || '';
           const loggedOut = statusCode === DisconnectReason.loggedOut;
+          const restartRequired = statusCode === DisconnectReason.restartRequired;
 
           if (this.sock === sock) {
             this.sock = null;
@@ -312,6 +325,7 @@ class BaileysManager {
             this.connectedPhone = null;
             this.connectedName = null;
             this.pairingCode = null;
+            this.pairingModeActive = false;
             this.lastError = 'Device logged out from WhatsApp. Generate a fresh QR to re-link.';
             this.clearAuthFolder();
             this.emitStatus();
@@ -327,8 +341,22 @@ class BaileysManager {
             this.connectedPhone = null;
             this.connectedName = null;
             this.pairingCode = null;
+            this.pairingModeActive = false;
             this.emitStatus();
             this.log('info', 'Disconnected from WhatsApp by admin.');
+            return;
+          }
+
+          // WhatsApp sends 515 (restartRequired) immediately after QR/8-digit pairing succeeds.
+          // Reconnect immediately (250ms) so mobile WhatsApp never times out during handshake!
+          if (restartRequired) {
+            this.status = 'CONNECTING';
+            this.lastError = null;
+            this.emitStatus();
+            this.log('info', 'WhatsApp requested fast handshake restart (515) — reconnecting immediately...');
+            this.reconnectTimer = setTimeout(() => {
+              this.connect().catch(() => {});
+            }, 250);
             return;
           }
 
@@ -726,6 +754,150 @@ class BaileysManager {
 
   public async repairQr(): Promise<BaileysStateSnapshot> {
     return this.connect({ forceFresh: true, waitForQrMs: 6000 });
+  }
+
+  public async exportSessionBundle(handover = true): Promise<{
+    ok: boolean;
+    bundle?: {
+      version: number;
+      exportedAt: string;
+      connectedPhone: string | null;
+      connectedName: string | null;
+      files: Record<string, string>;
+    };
+    error?: string;
+  }> {
+    if (!this.hasSavedCredentials()) {
+      return {
+        ok: false,
+        error: 'No linked WhatsApp session found on this server. Connect WhatsApp first.',
+      };
+    }
+
+    const files: Record<string, string> = {};
+    const collectDir = (dir: string, prefix: string) => {
+      if (!fs.existsSync(dir)) return;
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (entry.name.endsWith('.tmp') || entry.name === '.DS_Store') continue;
+        const full = path.join(dir, entry.name);
+        const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) {
+          collectDir(full, rel);
+        } else if (entry.isFile()) {
+          files[rel] = fs.readFileSync(full).toString('base64');
+        }
+      }
+    };
+
+    try {
+      collectDir(BAILEYS_AUTH_DIR, '');
+      if (!files['creds.json']) {
+        return { ok: false, error: 'WhatsApp credentials file (creds.json) is missing.' };
+      }
+
+      const bundle = {
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        connectedPhone: this.connectedPhone,
+        connectedName: this.connectedName,
+        files,
+      };
+
+      // Handover mode cleanly closes local socket WITHOUT logging out so Render can connect
+      // without WhatsApp throwing a 440 conflict error.
+      if (handover && this.sock) {
+        await this.disconnect(false);
+        this.log(
+          'info',
+          'Exported WhatsApp session bundle and paused local socket cleanly for server handover.'
+        );
+      }
+
+      return { ok: true, bundle };
+    } catch (err) {
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : 'Failed to export WhatsApp session.',
+      };
+    }
+  }
+
+  public async importSessionBundle(rawFiles: Record<string, string>): Promise<{
+    ok: boolean;
+    fileCount: number;
+    snapshot: BaileysStateSnapshot;
+    error?: string;
+  }> {
+    if (!rawFiles || typeof rawFiles !== 'object' || typeof rawFiles['creds.json'] !== 'string') {
+      return {
+        ok: false,
+        fileCount: 0,
+        snapshot: this.getSnapshot(),
+        error: 'Invalid session file. Make sure you upload a valid bgb-whatsapp-session.json file.',
+      };
+    }
+
+    try {
+      // Close any existing socket without logging out
+      await this.disconnect(false);
+
+      if (fs.existsSync(BAILEYS_AUTH_DIR)) {
+        fs.rmSync(BAILEYS_AUTH_DIR, { recursive: true, force: true });
+      }
+      fs.mkdirSync(BAILEYS_AUTH_DIR, { recursive: true });
+
+      const resolvedRoot = path.resolve(BAILEYS_AUTH_DIR);
+      let written = 0;
+
+      for (const [relPath, b64] of Object.entries(rawFiles)) {
+        if (typeof b64 !== 'string' || !relPath || relPath.includes('..') || path.isAbsolute(relPath)) {
+          continue;
+        }
+        const target = path.resolve(BAILEYS_AUTH_DIR, relPath);
+        if (!target.startsWith(resolvedRoot + path.sep)) {
+          continue;
+        }
+        const parent = path.dirname(target);
+        if (!fs.existsSync(parent)) {
+          fs.mkdirSync(parent, { recursive: true });
+        }
+        fs.writeFileSync(target, Buffer.from(b64, 'base64'));
+        written += 1;
+      }
+
+      if (written === 0 || !this.hasSavedCredentials()) {
+        return {
+          ok: false,
+          fileCount: 0,
+          snapshot: this.getSnapshot(),
+          error: 'Session import failed: creds.json could not be restored.',
+        };
+      }
+
+      this.log('success', `Imported ${written} WhatsApp session files. Connecting & syncing to vault...`);
+      void flushRemoteBackupNow('session_import');
+
+      const snap = await this.connect();
+      await this.waitForCondition(
+        () => this.status === 'CONNECTED' || Boolean(this.lastError),
+        7000
+      );
+
+      return {
+        ok: true,
+        fileCount: written,
+        snapshot: this.getSnapshot() || snap,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to import WhatsApp session.';
+      this.log('error', `Session import error: ${msg}`);
+      return {
+        ok: false,
+        fileCount: 0,
+        snapshot: this.getSnapshot(),
+        error: msg,
+      };
+    }
   }
 }
 

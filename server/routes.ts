@@ -94,7 +94,7 @@ export function createApiRouter(): express.Router {
   // Capture raw body for Meta HMAC-SHA256 webhook verification
   router.use(
     express.json({
-      limit: '2mb',
+      limit: '10mb',
       verify: (req, _res, buf) => {
         (req as AuthedRequest).rawBody = buf;
       },
@@ -559,6 +559,42 @@ export function createApiRouter(): express.Router {
       status: snap.status,
       qrDataUrl: snap.qrDataUrl,
       baileys: snap,
+    });
+  });
+
+  router.post('/whatsapp/session/export', async (req, res) => {
+    const handover = req.body?.handover !== false;
+    const result = await baileysManager.exportSessionBundle(handover);
+    if (!result.ok) {
+      res.status(400).json(result);
+      return;
+    }
+    res.json({
+      ...result,
+      baileys: baileysManager.getSnapshot(),
+    });
+  });
+
+  router.post('/whatsapp/session/import', async (req, res) => {
+    const files = req.body?.files as Record<string, string> | undefined;
+    if (!files || typeof files !== 'object') {
+      res.status(400).json({
+        ok: false,
+        error: 'Upload a valid bgb-whatsapp-session.json file containing a files object.',
+      });
+      return;
+    }
+    const result = await baileysManager.importSessionBundle(files);
+    if (!result.ok) {
+      res.status(400).json({
+        ...result,
+        baileys: baileysManager.getSnapshot(),
+      });
+      return;
+    }
+    res.json({
+      ...result,
+      baileys: result.snapshot,
     });
   });
 
