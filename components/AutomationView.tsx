@@ -21,7 +21,7 @@ export default function AutomationView({
   const [aiMode, setAiMode] = useState<AiGlobalMode>(
     settings.ai.mode || (settings.ai.enabled ? 'AUTO_ON' : 'MANUAL_ONLY')
   );
-  const [model, setModel] = useState(settings.ai.model || 'gemini-2.5-flash');
+  const [model, setModel] = useState(settings.ai.model || 'gemini-4-hydrogen');
   const [temperature, setTemperature] = useState(settings.ai.temperature);
   const [systemPrompt, setSystemPrompt] = useState(settings.ai.systemPrompt);
   const [cooldown, setCooldown] = useState(settings.ai.handoverCooldownMinutes);
@@ -199,8 +199,9 @@ export default function AutomationView({
                 onChange={(e) => setModel(e.target.value)}
                 className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900"
               >
-                <option value="gemini-2.5-flash">gemini-2.5-flash</option>
-                <option value="gemini-4-hydrogen">gemini-4-hydrogen</option>
+                <option value="gemini-4-hydrogen">gemini-4-hydrogen (Recommended · Fast)</option>
+                <option value="gemini-3.8-flash">gemini-3.8-flash (Fast Flash)</option>
+                <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite (Ultra-Fast Lite)</option>
               </select>
             </div>
 

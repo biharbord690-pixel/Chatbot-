@@ -3,6 +3,7 @@ import {
   FunctionDeclaration,
   GoogleGenAI,
   Part,
+  ThinkingLevel,
   Type,
 } from '@google/genai';
 import type { CustomerState, ToolCallLog } from '../lib/types';
@@ -30,8 +31,6 @@ function getGeminiClient(): GoogleGenAI {
   cachedGeminiKey = apiKey;
   cachedGeminiClient = new GoogleGenAI({
     apiKey,
-    // Function calling (tools / functionDeclarations) requires v1beta on @google/genai v2+
-    apiVersion: 'v1beta',
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
@@ -367,8 +366,13 @@ export async function generateAiReply(params: {
   }
 
   const ai = getGeminiClient();
-  const configuredModel = (aiSettings.model || '').trim();
-  const modelName = configuredModel || 'gemini-2.5-flash';
+  const rawConfiguredModel = (aiSettings.model || '').trim();
+  const isRetiredModel =
+    !rawConfiguredModel ||
+    rawConfiguredModel.startsWith('gemini-1.') ||
+    rawConfiguredModel.startsWith('gemini-2.') ||
+    rawConfiguredModel === 'gemini-pro';
+  const modelName = isRetiredModel ? 'gemini-4-hydrogen' : rawConfiguredModel;
 
   const sessionContextNote = `\n\n[वर्तमान ग्राहक संदर्भ]:\n- WhatsApp फोन: +${phone}\n- ग्राहक नाम: ${session.name}\n- वर्तमान स्थिति (State): ${session.state}\n- पिछला देखा गया उत्पाद: ${session.context.lastProductName || 'कोई नहीं'} (ID: ${session.context.lastProductId || 'N/A'})\n- पिछला ऑर्डर ID: ${session.context.lastOrderId || 'कोई नहीं'}`;
 
@@ -378,11 +382,11 @@ export async function generateAiReply(params: {
   let nextState: CustomerState = session.state;
   let matchedProductCard: GeminiReplyResult['matchedProductCard'];
 
-  const buildConfig = (targetModel: string, includeThinkingZero: boolean) => {
+  const buildConfig = (targetModel: string, includeOptionalParams: boolean) => {
     const isGemini4 = targetModel.startsWith('gemini-4');
+    const isFlashLite = targetModel.includes('flash-lite');
     const baseConfig: Record<string, unknown> = {
       systemInstruction,
-      maxOutputTokens: 600,
       tools: [
         {
           functionDeclarations: [
@@ -393,52 +397,75 @@ export async function generateAiReply(params: {
         },
       ],
     };
-    if (!isGemini4) {
-      baseConfig.temperature = aiSettings.temperature;
+
+    if (includeOptionalParams) {
+      // Never pass deprecated sampling params (temperature) to Gemini 4 series models
+      if (!isGemini4) {
+        baseConfig.temperature = aiSettings.temperature;
+      }
+
+      // Use LOW / MINIMAL ThinkingLevel on Gemini 3 & 4 models for ultra-fast WhatsApp chat replies
+      if (isGemini4 || targetModel.startsWith('gemini-3')) {
+        baseConfig.thinkingConfig = {
+          thinkingLevel: isFlashLite ? ThinkingLevel.MINIMAL : ThinkingLevel.LOW,
+        };
+      }
     }
-    // Disable hidden thinking tokens on Gemini 2.5 Flash for ultra-fast (<1s) WhatsApp replies
-    if (includeThinkingZero && targetModel.includes('2.5-flash')) {
-      baseConfig.thinkingConfig = { thinkingBudget: 0 };
-    }
+
     return baseConfig;
   };
 
-  let activeModel = modelName;
-  let useThinkingZero = activeModel.includes('2.5-flash');
+  // Ordered active free-tier fallback list (never uses deprecated 1.5/2.0/2.5 models)
+  const candidateModels = Array.from(
+    new Set([modelName, 'gemini-4-hydrogen', 'gemini-3.8-flash', 'gemini-3.1-flash-lite'])
+  );
+  let activeModel = candidateModels[0];
+  let useOptionalParams = true;
 
   const callModelSafely = async (turnContents: Content[]) => {
-    try {
-      return await ai.models.generateContent({
-        model: activeModel,
-        contents: turnContents,
-        config: buildConfig(activeModel, useThinkingZero),
-      });
-    } catch (firstErr) {
-      const msg = formatFullError(firstErr).toLowerCase();
-      // Retry 1: If thinkingConfig caused a 400 INVALID_ARGUMENT, retry cleanly without it
-      if (useThinkingZero && (msg.includes('thinking') || msg.includes('invalid_argument') || msg.includes('400'))) {
-        useThinkingZero = false;
-        return await ai.models.generateContent({
-          model: activeModel,
+    let lastError: unknown;
+    const startIdx = Math.max(0, candidateModels.indexOf(activeModel));
+
+    for (let i = startIdx; i < candidateModels.length; i += 1) {
+      const candidate = candidateModels[i];
+      try {
+        const res = await ai.models.generateContent({
+          model: candidate,
           contents: turnContents,
-          config: buildConfig(activeModel, false),
+          config: buildConfig(candidate, useOptionalParams),
         });
+        activeModel = candidate;
+        return res;
+      } catch (err) {
+        lastError = err;
+        const msg = formatFullError(err).toLowerCase();
+
+        // If thinkingConfig or temperature was rejected by this model, retry cleanly with minimal config
+        if (useOptionalParams && (msg.includes('thinking') || msg.includes('temperature') || msg.includes('invalid_argument') || msg.includes('400'))) {
+          try {
+            const retryRes = await ai.models.generateContent({
+              model: candidate,
+              contents: turnContents,
+              config: buildConfig(candidate, false),
+            });
+            activeModel = candidate;
+            useOptionalParams = false;
+            return retryRes;
+          } catch (retryErr) {
+            lastError = retryErr;
+          }
+        }
+
+        // If API key is invalid/unauthorized, fail immediately rather than trying other models
+        const retryMsg = formatFullError(lastError).toLowerCase();
+        if (retryMsg.includes('api_key_invalid') || retryMsg.includes('permission_denied') || retryMsg.includes('403')) {
+          throw lastError;
+        }
+        // Otherwise (404 NOT_FOUND / 503 overloaded / 429), fall through to next active model
       }
-      // Retry 2: If configured model is unavailable/deprecated/overloaded, fall back to gemini-2.0-flash
-      if (
-        activeModel !== 'gemini-2.0-flash' &&
-        (msg.includes('404') || msg.includes('not found') || msg.includes('503') || msg.includes('overloaded'))
-      ) {
-        activeModel = 'gemini-2.0-flash';
-        useThinkingZero = false;
-        return await ai.models.generateContent({
-          model: activeModel,
-          contents: turnContents,
-          config: buildConfig(activeModel, false),
-        });
-      }
-      throw firstErr;
     }
+
+    throw lastError;
   };
 
   try {
@@ -698,7 +725,7 @@ export async function generateAiReply(params: {
       phone,
       query: params.messageText.slice(0, 300),
       reply: '',
-      model: modelName,
+      model: activeModel,
       toolsUsed: toolCallsLog.map((t) => t.name),
       latencyMs: Date.now() - startedAt,
       status: 'ERROR',

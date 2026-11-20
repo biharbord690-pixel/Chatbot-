@@ -300,7 +300,7 @@ function createInitialStore(): PersistedStore {
       ai: {
         enabled: true,
         mode: 'AUTO_ON',
-        model: 'gemini-2.5-flash',
+        model: 'gemini-4-hydrogen',
         temperature: 0.3,
         systemPrompt: DEFAULT_SYSTEM_PROMPT,
         handoverCooldownMinutes: 30,
@@ -410,6 +410,19 @@ class StorageManager {
       };
       let diskMutated = false;
       if (this.syncAdminAccountEmail(merged)) {
+        this.lastLoadMigratedAdmin = true;
+        diskMutated = true;
+      }
+
+      // Automatically upgrade retired/deprecated Gemini 1.5/2.0/2.5 models to active gemini-4-hydrogen
+      const savedModel = (merged.settings.ai.model || '').trim().toLowerCase();
+      if (
+        !savedModel ||
+        savedModel.startsWith('gemini-1.') ||
+        savedModel.startsWith('gemini-2.') ||
+        savedModel === 'gemini-pro'
+      ) {
+        merged.settings.ai.model = 'gemini-4-hydrogen';
         this.lastLoadMigratedAdmin = true;
         diskMutated = true;
       }

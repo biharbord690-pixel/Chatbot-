@@ -255,7 +255,7 @@ export default function SettingsView({
                 <p className="font-medium text-slate-900 dark:text-white">Gemini AI Server Runtime</p>
                 <p className="text-xs text-slate-500 dark:text-slate-400">
                   Managed via server environment secret (GEMINI_API_KEY) · Model:{' '}
-                  <span className="font-mono">{settings.ai.model || 'gemini-2.5-flash'}</span>
+                  <span className="font-mono">{settings.ai.model || 'gemini-4-hydrogen'}</span>
                 </p>
               </div>
               <div className="flex items-center gap-3">
